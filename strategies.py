@@ -17,6 +17,7 @@ class Signal:
     strategy_name: str
     entry_price: float    # price of the token we'd buy
     signal_data: dict[str, Any] = field(default_factory=dict)
+    confidence_multiplier: float = 1.0
 
 
 async def evaluate_farming(market: db.MarketInfo) -> Signal | None:
@@ -148,44 +149,87 @@ async def evaluate_calibration(market: db.MarketInfo) -> Signal | None:
     return None
 
 
+def calculate_confidence(signal_type: str, signal_data: dict) -> float:
+    """
+    Returns a multiplier between BET_SIZE_MIN_MULTIPLIER and BET_SIZE_MAX_MULTIPLIER.
+    Higher = more confident = bigger bet.
+    """
+    if signal_type == 'momentum':
+        momentum_value = abs(signal_data.get('momentum_value', 0.02))
+        entry_price = signal_data.get('entry_price', 0.5)
+
+        # Momentum strength score (0.0 to 1.0)
+        momentum_score = min(momentum_value / 0.08, 1.0)
+
+        # Price centrality score (0.0 to 1.0) — prices near 0.5 = better edge
+        price_centrality = 1.0 - abs(entry_price - 0.5) * 2
+        price_score = max(price_centrality, 0.0)
+
+        # Combined: 70% momentum strength, 30% price centrality
+        confidence = (momentum_score * 0.7) + (price_score * 0.3)
+
+    elif signal_type == 'farming':
+        entry_price = signal_data.get('entry_price', 0.65)
+        seconds_elapsed = signal_data.get('seconds_elapsed', 60)
+
+        # Price extremity score (0.0 to 1.0) — more extreme = stronger signal
+        price_extremity = (abs(entry_price - 0.5) - 0.15) / 0.30
+        price_score = max(min(price_extremity, 1.0), 0.0)
+
+        # Time score (0.0 to 1.0) — earlier entry = better
+        time_score = max(1.0 - (seconds_elapsed - 60) / 120, 0.0)
+
+        # Combined: 60% price extremity, 40% time
+        confidence = (price_score * 0.6) + (time_score * 0.4)
+
+    elif signal_type == 'streak':
+        streak_length = signal_data.get('streak_length', 3)
+        streak_score = min((streak_length - 3) / 2, 1.0)
+        confidence = 0.5 + (streak_score * 0.5)
+
+    elif signal_type == 'calibration':
+        deviation = abs(signal_data.get('deviation', 0.05))
+        deviation_score = min(deviation / 0.15, 1.0)
+        confidence = deviation_score
+
+    else:
+        confidence = 0.5
+
+    # Map confidence (0.0-1.0) to multiplier range
+    min_mult = config.BET_SIZE_MIN_MULTIPLIER
+    max_mult = config.BET_SIZE_MAX_MULTIPLIER
+    multiplier = min_mult + (confidence * (max_mult - min_mult))
+
+    # Round to nearest 0.5x to avoid tiny differences
+    multiplier = round(multiplier * 2) / 2
+
+    return multiplier
+
+
 async def evaluate_strategies(market: db.MarketInfo) -> Signal | None:
     """Try each enabled strategy in priority order. Return first signal found."""
 
+    strategies = []
     if config.STRATEGY_MOMENTUM_ENABLED:
-        # Only evaluate if not already traded this market with this strategy
-        if not await db.already_traded_this_market(market.market_id, "momentum"):
-            signal = await evaluate_momentum(market)
-            if signal:
-                log.info("Signal: %s %s on %s (price=%.4f)",
-                         signal.strategy_name, signal.direction,
-                         market.market_id[:16], signal.entry_price)
-                return signal
-
+        strategies.append(("momentum", evaluate_momentum))
     if config.STRATEGY_STREAK_ENABLED:
-        if not await db.already_traded_this_market(market.market_id, "streak"):
-            signal = await evaluate_streak(market)
-            if signal:
-                log.info("Signal: %s %s on %s (price=%.4f)",
-                         signal.strategy_name, signal.direction,
-                         market.market_id[:16], signal.entry_price)
-                return signal
-
+        strategies.append(("streak", evaluate_streak))
     if config.STRATEGY_CALIBRATION_ENABLED:
-        if not await db.already_traded_this_market(market.market_id, "calibration"):
-            signal = await evaluate_calibration(market)
-            if signal:
-                log.info("Signal: %s %s on %s (price=%.4f)",
-                         signal.strategy_name, signal.direction,
-                         market.market_id[:16], signal.entry_price)
-                return signal
-
+        strategies.append(("calibration", evaluate_calibration))
     if config.STRATEGY_FARMING_ENABLED:
-        if not await db.already_traded_this_market(market.market_id, "farming"):
-            signal = await evaluate_farming(market)
+        strategies.append(("farming", evaluate_farming))
+
+    for name, evaluate_fn in strategies:
+        if not await db.already_traded_this_market(market.market_id, name):
+            signal = await evaluate_fn(market)
             if signal:
-                log.info("Signal: %s %s on %s (price=%.4f)",
+                signal.confidence_multiplier = calculate_confidence(
+                    signal.strategy_name, signal.signal_data or {}
+                )
+                log.info("Signal: %s %s on %s (price=%.4f, confidence=%.1fx)",
                          signal.strategy_name, signal.direction,
-                         market.market_id[:16], signal.entry_price)
+                         market.market_id[:16], signal.entry_price,
+                         signal.confidence_multiplier)
                 return signal
 
     return None

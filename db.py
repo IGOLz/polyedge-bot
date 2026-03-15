@@ -80,7 +80,8 @@ CREATE TABLE IF NOT EXISTS bot_trades (
     final_outcome   TEXT,
     pnl             NUMERIC(10,2),
     notes           TEXT,
-    redeemed        BOOLEAN NOT NULL DEFAULT FALSE
+    redeemed        BOOLEAN NOT NULL DEFAULT FALSE,
+    confidence_multiplier NUMERIC(4,2) DEFAULT 1.0
 );
 """
 
@@ -89,9 +90,12 @@ async def _create_tables() -> None:
     async with pool().acquire() as conn:
         await conn.execute(_CREATE_BOT_TRADES)
         await conn.execute(_CREATE_BOT_LOGS)
-        # Add redeemed column to existing tables (idempotent)
+        # Add columns to existing tables (idempotent)
         await conn.execute("""
             ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS redeemed BOOLEAN NOT NULL DEFAULT FALSE
+        """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS confidence_multiplier NUMERIC(4,2) DEFAULT 1.0
         """)
 
 
@@ -242,6 +246,7 @@ async def insert_bot_trade(
     status: str,
     order_id: str | None = None,
     notes: str | None = None,
+    confidence_multiplier: float = 1.0,
 ) -> int:
     """Insert a trade record and return its id."""
     async with pool().acquire() as conn:
@@ -249,14 +254,15 @@ async def insert_bot_trade(
             INSERT INTO bot_trades
                 (market_id, market_type, strategy_name, direction,
                  entry_price, bet_size_usd, shares, token_id,
-                 condition_id, status, order_id, notes)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                 condition_id, status, order_id, notes, confidence_multiplier)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             RETURNING id
         """,
             market_id, market_type, strategy_name, direction,
             Decimal(str(entry_price)), Decimal(str(bet_size_usd)),
             Decimal(str(shares)) if shares is not None else None,
             token_id, condition_id, status, order_id, notes,
+            Decimal(str(confidence_multiplier)),
         )
     return row["id"]
 

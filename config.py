@@ -62,6 +62,8 @@ CALIBRATION_MIN_DEVIATION: float = float(os.getenv("CALIBRATION_MIN_DEVIATION", 
 
 # ── Betting ──────────────────────────────────────────────────────────────
 BET_SIZE_USD: float = float(os.getenv("BET_SIZE_USD", "1.5"))
+BET_SIZE_MIN_MULTIPLIER: float = float(os.getenv("BET_SIZE_MIN_MULTIPLIER", "0.5"))
+BET_SIZE_MAX_MULTIPLIER: float = float(os.getenv("BET_SIZE_MAX_MULTIPLIER", "2.0"))
 DAILY_LOSS_LIMIT: float = float(os.getenv("DAILY_LOSS_LIMIT", "30.0"))
 LOOP_INTERVAL: int = int(os.getenv("LOOP_INTERVAL", "5"))
 

@@ -127,17 +127,29 @@ async def execute_trade(
 
     market_label = f"{market.market_type}:{market.market_id[:12]}"
 
+    # ── Calculate dynamic bet size ─────────────────────────────────────
+    bet_size = round(config.BET_SIZE_USD * signal.confidence_multiplier, 2)
+    bet_size = max(bet_size, 1.00)  # Polymarket minimum order
+
+    log.info(
+        "[CONFIDENCE] %s on %s — multiplier: %.1fx → bet: $%.2f",
+        signal.strategy_name, market.market_type,
+        signal.confidence_multiplier, bet_size,
+    )
+
     # ── Dry-run mode ────────────────────────────────────────────────────
     if config.DRY_RUN:
         log.info(
-            "[DRY RUN] Would place BUY %s on %s at %.4f — strategy: %s",
-            signal.direction, market_label, signal.entry_price, signal.strategy_name,
+            "[DRY RUN] Would place BUY %s on %s at %.4f — strategy: %s (%.1fx → $%.2f)",
+            signal.direction, market_label, signal.entry_price,
+            signal.strategy_name, signal.confidence_multiplier, bet_size,
         )
-        print(f"{Fore.YELLOW}[DRY RUN] Would place BUY {signal.direction} on {market_label} at {signal.entry_price:.4f} — strategy: {signal.strategy_name}{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}[DRY RUN] Would place BUY {signal.direction} on {market_label} at {signal.entry_price:.4f} — strategy: {signal.strategy_name} ({signal.confidence_multiplier:.1f}x → ${bet_size:.2f}){Style.RESET_ALL}")
         await db.insert_bot_trade(
             market_id=market.market_id, market_type=market.market_type,
             strategy_name=signal.strategy_name, direction=signal.direction,
-            entry_price=signal.entry_price, bet_size_usd=config.BET_SIZE_USD,
+            entry_price=signal.entry_price, bet_size_usd=bet_size,
+            confidence_multiplier=signal.confidence_multiplier,
             status="dry_run", condition_id=market.market_id,
         )
         await db.log_event("trade_dry_run",
@@ -157,7 +169,8 @@ async def execute_trade(
         await db.insert_bot_trade(
             market_id=market.market_id, market_type=market.market_type,
             strategy_name=signal.strategy_name, direction=signal.direction,
-            entry_price=signal.entry_price, bet_size_usd=config.BET_SIZE_USD,
+            entry_price=signal.entry_price, bet_size_usd=bet_size,
+            confidence_multiplier=signal.confidence_multiplier,
             status="skipped_daily_limit", condition_id=market.market_id,
         )
         await db.log_event("trade_skipped",
@@ -182,7 +195,8 @@ async def execute_trade(
             await db.insert_bot_trade(
                 market_id=market.market_id, market_type=market.market_type,
                 strategy_name=signal.strategy_name, direction=signal.direction,
-                entry_price=signal.entry_price, bet_size_usd=config.BET_SIZE_USD,
+                entry_price=signal.entry_price, bet_size_usd=bet_size,
+                confidence_multiplier=signal.confidence_multiplier,
                 status="skipped_bankroll", condition_id=market.market_id,
             )
             await db.log_event("trade_skipped",
@@ -208,7 +222,8 @@ async def execute_trade(
             await db.insert_bot_trade(
                 market_id=market.market_id, market_type=market.market_type,
                 strategy_name=signal.strategy_name, direction=signal.direction,
-                entry_price=signal.entry_price, bet_size_usd=config.BET_SIZE_USD,
+                entry_price=signal.entry_price, bet_size_usd=bet_size,
+                confidence_multiplier=signal.confidence_multiplier,
                 status="error", condition_id=market.market_id,
                 notes="Failed to resolve token IDs",
             )
@@ -230,7 +245,8 @@ async def execute_trade(
         await db.insert_bot_trade(
             market_id=market.market_id, market_type=market.market_type,
             strategy_name=signal.strategy_name, direction=signal.direction,
-            entry_price=signal.entry_price, bet_size_usd=config.BET_SIZE_USD,
+            entry_price=signal.entry_price, bet_size_usd=bet_size,
+            confidence_multiplier=signal.confidence_multiplier,
             token_id=token_id, condition_id=market.market_id,
             status="error", notes="No liquidity",
         )
@@ -256,13 +272,14 @@ async def execute_trade(
             await db.insert_bot_trade(
                 market_id=market.market_id, market_type=market.market_type,
                 strategy_name=signal.strategy_name, direction=signal.direction,
-                entry_price=best_price, bet_size_usd=config.BET_SIZE_USD,
+                entry_price=best_price, bet_size_usd=bet_size,
+                confidence_multiplier=signal.confidence_multiplier,
                 token_id=token_id, condition_id=market.market_id,
                 status="error", notes=f"Price out of range: {rounded_price}",
             )
             return
 
-        my_shares = math.floor(config.BET_SIZE_USD / rounded_price)
+        my_shares = math.floor(bet_size / rounded_price)
         min_shares = math.ceil(MIN_DOLLAR_SIZE / rounded_price)
         if my_shares < min_shares:
             my_shares = min_shares
@@ -271,7 +288,8 @@ async def execute_trade(
             await db.insert_bot_trade(
                 market_id=market.market_id, market_type=market.market_type,
                 strategy_name=signal.strategy_name, direction=signal.direction,
-                entry_price=best_price, bet_size_usd=config.BET_SIZE_USD,
+                entry_price=best_price, bet_size_usd=bet_size,
+                confidence_multiplier=signal.confidence_multiplier,
                 token_id=token_id, condition_id=market.market_id,
                 status="error", notes="Order too small",
             )
@@ -304,11 +322,11 @@ async def execute_trade(
         else:
             status = "filled"
             log.info(
-                "TRADE PLACED — %s %s on %s | $%.2f (%d shares) @ %.2f | order=%s",
+                "TRADE PLACED — %s %s on %s | $%.2f (%.1fx) (%d shares) @ %.2f | order=%s",
                 signal.strategy_name, signal.direction, market_label,
-                config.BET_SIZE_USD, my_shares, rounded_price, order_id,
+                bet_size, signal.confidence_multiplier, my_shares, rounded_price, order_id,
             )
-            print(f"{Fore.GREEN}*** TRADE: {signal.strategy_name} {signal.direction} on {market_label} — ${config.BET_SIZE_USD:.2f} @ {rounded_price:.2f} ***{Style.RESET_ALL}")
+            print(f"{Fore.GREEN}*** TRADE: {signal.strategy_name} {signal.direction} on {market_label} — ${bet_size:.2f} ({signal.confidence_multiplier:.1f}x) @ {rounded_price:.2f} ***{Style.RESET_ALL}")
 
             new_balance = await get_usdc_balance()
 
@@ -319,7 +337,8 @@ async def execute_trade(
                     "strategy_name": signal.strategy_name,
                     "direction": signal.direction,
                     "entry_price": rounded_price,
-                    "bet_size_usd": config.BET_SIZE_USD,
+                    "bet_size_usd": bet_size,
+                    "confidence_multiplier": signal.confidence_multiplier,
                     "shares": my_shares,
                     "token_id": token_id,
                     "order_id": order_id,
@@ -364,7 +383,8 @@ async def execute_trade(
         strategy_name=signal.strategy_name,
         direction=signal.direction,
         entry_price=best_price or signal.entry_price,
-        bet_size_usd=config.BET_SIZE_USD,
+        bet_size_usd=bet_size,
+        confidence_multiplier=signal.confidence_multiplier,
         shares=my_shares,
         token_id=token_id,
         condition_id=market.market_id,
