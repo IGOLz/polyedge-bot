@@ -52,16 +52,60 @@ async def verify_proxy() -> None:
         sys.exit(1)
 
 
-async def outcome_tracker_loop() -> None:
+async def heartbeat_loop() -> None:
+    """Background loop: log heartbeat every 10 seconds."""
+    while True:
+        log.info("[HEARTBEAT] Bot alive — %s", datetime.now(timezone.utc).strftime('%H:%M:%S'))
+        await asyncio.sleep(10)
+
+
+async def outcome_tracker_loop(clob) -> None:
     """Background loop: bulk-resolve filled trades via market_outcomes join."""
     log.info("Outcome tracker started (every 5 min)")
     while True:
+
         try:
-            await db.update_pending_outcomes()
+            await db.update_pending_outcomes(clob)
         except Exception:
             log.exception("Error in outcome tracker")
 
         await asyncio.sleep(300)  # 5 minutes
+
+
+async def stop_loss_monitor_loop(clob) -> None:
+    """Background loop: check if any GTC stop-loss orders have been filled."""
+    log.info("Stop-loss monitor started (every 30s)")
+    while True:
+
+        try:
+            open_stop_losses = await db.get_open_stop_loss_orders(db.pool())
+
+            for trade in open_stop_losses:
+                order_id = trade['stop_loss_order_id']
+                try:
+                    loop = asyncio.get_event_loop()
+                    order = await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda oid=order_id: clob.get_order(oid)),
+                        timeout=10.0,
+                    )
+                    status = order.get('status', '') if isinstance(order, dict) else ''
+
+                    if status in ('FILLED', 'MATCHED'):
+                        log.info("[STOP-LOSS] Stop-loss triggered for trade %d", trade['id'])
+                        await db.mark_stop_loss_triggered(db.pool(), trade['id'])
+                        await db.log_event('trade_stop_loss',
+                            "Stop-loss triggered — position closed",
+                            {'trade_id': trade['id'], 'stop_loss_order_id': order_id},
+                        )
+                except asyncio.TimeoutError:
+                    log.warning("[STOP-LOSS] Timeout checking order %s", order_id[:16])
+                except Exception as e:
+                    log.warning("[STOP-LOSS] Could not check order %s: %s", order_id[:16], e)
+
+        except Exception as e:
+            log.error("[STOP-LOSS] Monitor loop error: %s", e)
+
+        await asyncio.sleep(30)
 
 
 async def hourly_summary_loop() -> None:
@@ -92,26 +136,16 @@ async def hourly_summary_loop() -> None:
             log.exception("Error in hourly summary")
 
 
-def _enabled_strategies_list() -> list[str]:
-    enabled = []
-    if config.STRATEGY_MOMENTUM_ENABLED:
-        enabled.append("momentum")
-    if config.STRATEGY_STREAK_ENABLED:
-        enabled.append("streak")
-    if config.STRATEGY_CALIBRATION_ENABLED:
-        enabled.append("calibration")
-    if config.STRATEGY_FARMING_ENABLED:
-        enabled.append("farming")
-    return enabled
-
-
 async def run() -> None:
     colorama_init()
+    asyncio.create_task(heartbeat_loop())
+
     await verify_proxy()
     config.patch_clob_client_proxy(config.PROXY_URL)
 
     # Init PostgreSQL
     await db.init_pool()
+    await db.seed_config_if_empty()
 
     # Build CLOB client
     clob = build_clob_client()
@@ -128,7 +162,7 @@ async def run() -> None:
 
     # Resolve any pending outcomes from before bot started
     try:
-        await db.update_pending_outcomes()
+        await db.update_pending_outcomes(clob)
         log.info("Startup outcome resolution complete")
     except Exception:
         log.exception("Error resolving outcomes on startup")
@@ -140,14 +174,11 @@ async def run() -> None:
         log.warning("Balance low: $%.2f — trading paused, redemption still running", balance)
         # Don't return — continue startup so redemption loop can run
 
-    enabled = _enabled_strategies_list()
-
     if config.DRY_RUN:
         log.info("[DRY RUN] Mode active — no real orders will be placed")
 
     # Log bot_start event
     await db.log_event("bot_start", "Bot started", {
-        "strategies_enabled": enabled,
         "bet_size": config.BET_SIZE_USD,
         "daily_loss_limit": config.DAILY_LOSS_LIMIT,
         "balance": balance,
@@ -155,29 +186,84 @@ async def run() -> None:
     })
 
     # Start remaining background tasks
-    asyncio.create_task(outcome_tracker_loop())
+    asyncio.create_task(outcome_tracker_loop(clob))
+    asyncio.create_task(stop_loss_monitor_loop(clob))
     asyncio.create_task(hourly_summary_loop())
 
     log.info(
-        "Bot started at %s UTC — mode=%s | $%.2f/trade | daily loss limit $%.2f | loop every %ds | strategies=%s",
+        "Bot started at %s UTC — mode=%s | $%.2f/trade | daily loss limit $%.2f",
         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "DRY RUN" if config.DRY_RUN else "LIVE",
         config.BET_SIZE_USD,
         config.DAILY_LOSS_LIMIT,
-        config.LOOP_INTERVAL,
-        ", ".join(enabled),
     )
 
     # ── Main strategy evaluation loop ───────────────────────────────────
     backoff = 0
+    previous_config: dict[str, str] = {}
+    first_iteration = True
     while True:
+
         try:
+            live_config = await db.get_live_config()
+
+            # Log active strategies on first iteration (from database, not .env)
+            if first_iteration:
+                enabled = [k.replace('strategy_', '').replace('_enabled', '')
+                           for k, v in live_config.items()
+                           if k.endswith('_enabled') and v == 'true']
+                log.info("[CONFIG] Active strategies: %s", ', '.join(enabled) or 'none')
+                log.info("[CONFIG] Bet size: $%s | Daily loss limit: $%s",
+                         live_config.get('bet_size_usd', '?'), live_config.get('daily_loss_limit', '?'))
+
+                if live_config.get('strategy_farming_enabled') == 'true':
+                    log.info("[CONFIG] Farming — trigger: %s | exit: %s | max_minutes: %s | stop_loss: %s (exit: %s)",
+                             live_config.get('farming_trigger_point'), live_config.get('farming_exit_point'),
+                             live_config.get('farming_trigger_minutes'),
+                             live_config.get('farming_use_stop_loss', 'true'),
+                             live_config.get('farming_exit_point'))
+
+                if live_config.get('strategy_momentum_enabled') == 'true':
+                    log.info("[CONFIG] Momentum — min_threshold: %s | stop_loss: %s (exit: %s)",
+                             live_config.get('momentum_min_threshold'),
+                             live_config.get('momentum_use_stop_loss', 'true'),
+                             live_config.get('momentum_exit_point', '0.50'))
+
+                if live_config.get('strategy_streak_enabled') == 'true':
+                    log.info("[CONFIG] Streak — length: %s | direction: %s",
+                             live_config.get('streak_length'), live_config.get('streak_direction'))
+
+                if live_config.get('strategy_calibration_enabled') == 'true':
+                    log.info("[CONFIG] Calibration — max_entry_seconds: %s | range: %s-%s | min_dev: %s",
+                             live_config.get('calibration_max_entry_seconds'),
+                             live_config.get('calibration_entry_low'), live_config.get('calibration_entry_high'),
+                             live_config.get('calibration_min_deviation'))
+
+                if live_config.get('strategy_late_dip_recovery_enabled') == 'true':
+                    log.info("[CONFIG] Late Dip Recovery — min_avg_price: %s | min_drop: %s | window: min 10-14 | stop_loss: %s (exit: %s)",
+                             live_config.get('late_dip_min_avg_price', '0.65'),
+                             live_config.get('late_dip_min_drop', '0.20'),
+                             live_config.get('late_dip_use_stop_loss', 'true'),
+                             live_config.get('late_dip_exit_point', '0.35'))
+
+                first_iteration = False
+
+            # Log any config changes
+            if previous_config and live_config != previous_config:
+                for key in set(live_config) | set(previous_config):
+                    old_val = previous_config.get(key)
+                    new_val = live_config.get(key)
+                    if old_val != new_val:
+                        log.info("[CONFIG] %s changed: %s → %s", key, old_val, new_val)
+            previous_config = live_config.copy()
+
             active_markets = await db.get_active_markets()
 
+
             for market in active_markets:
-                signal = await evaluate_strategies(market)
+                signal = await evaluate_strategies(market, live_config)
                 if signal:
-                    await execute_trade(clob, market, signal)
+                    await execute_trade(clob, market, signal, live_config)
 
             backoff = 0  # reset on success
 

@@ -348,6 +348,7 @@ async def redemption_loop() -> None:
     """Run redemption checks every 5 minutes, starting immediately."""
     log.info("Redemption loop started (every %d min)", REDEEM_INTERVAL // 60)
     while True:
+
         try:
             await _redeem_cycle()
         except Exception:

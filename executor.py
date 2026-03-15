@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from datetime import datetime, timezone
 
@@ -49,9 +50,10 @@ def record_trade_outcome(pnl: float) -> None:
         _daily_net_loss = max(0.0, _daily_net_loss - pnl)
 
 
-def is_daily_limit_reached() -> bool:
+def is_daily_limit_reached(daily_limit: float | None = None) -> bool:
     _reset_daily_if_needed()
-    return _daily_net_loss >= config.DAILY_LOSS_LIMIT
+    limit = daily_limit if daily_limit is not None else config.DAILY_LOSS_LIMIT
+    return _daily_net_loss >= limit
 
 
 def _get_best_price(clob: ClobClient, token_id: str, side: str) -> float | None:
@@ -80,10 +82,11 @@ def _fetch_token_ids(clob: ClobClient, condition_id: str) -> tuple[str, str] | N
         return _token_cache[condition_id]
 
     try:
-        with config.get_sync_http_client(timeout=10.0) as client:
+        with config.get_sync_http_client(timeout=5.0) as client:
             resp = client.get(f"{config.CLOB_BASE_URL}/markets/{condition_id}")
             resp.raise_for_status()
             data = resp.json()
+
 
         # CLOB API returns a list of two token objects for binary markets
         if isinstance(data, list) and len(data) >= 2:
@@ -110,32 +113,132 @@ def _fetch_token_ids(clob: ClobClient, condition_id: str) -> tuple[str, str] | N
                     result = (up_id, down_id)
                     _token_cache[condition_id] = result
                     return result
+            else:
+                log.warning("[TOKENS] No tokens in market detail for %s", condition_id[:16])
 
-    except Exception:
-        log.warning("Failed to fetch token IDs for condition %s", condition_id)
+    except Exception as e:
+        log.warning("[TOKENS] Error fetching market %s: %s", condition_id[:16], e)
 
     return None
+
+
+async def place_stop_loss_order(clob, p, trade_id: int, token_id: str, shares: float, stop_loss_price: float) -> None:
+    """Place a GTC sell order as a stop-loss for a filled trade."""
+    await asyncio.sleep(5)  # wait for token settlement before placing stop-loss
+
+    # Verify token balance before placing sell order
+    loop = asyncio.get_event_loop()
+    balance = 0
+    for attempt in range(5):
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            balance_resp = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: clob.get_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                )),
+                timeout=5.0,
+            )
+            log.info("[STOP-LOSS] Full balance response: %s", balance_resp)
+            balance = int(balance_resp.get('balance', '0')) if isinstance(balance_resp, dict) else 0
+            log.info("[STOP-LOSS] Token balance check attempt %d: %d", attempt + 1, balance)
+            if balance > 0:
+                break
+            await asyncio.sleep(3)
+        except Exception as e:
+            log.warning("[STOP-LOSS] Balance check failed attempt %d: %s", attempt + 1, e)
+            await asyncio.sleep(3)
+
+    if balance == 0:
+        log.warning("[STOP-LOSS] Token balance is 0 after 5 attempts — skipping stop-loss for trade %d", trade_id)
+        return
+
+    # Convert raw balance to shares (CTF tokens use 6 decimal places)
+    actual_shares = balance / 1_000_000
+    sellable_shares = math.floor(actual_shares)
+
+    if sellable_shares <= 0:
+        log.warning("[STOP-LOSS] Sellable shares is 0 after balance conversion — skipping")
+        return
+
+    log.info("[STOP-LOSS] Actual balance: %.4f shares | selling: %d shares", actual_shares, sellable_shares)
+
+    from py_clob_client.order_builder.constants import SELL
+    log.info("[STOP-LOSS] Attempting GTC sell — token: %s | shares: %d | price: %s | trade_id: %d",
+             token_id[:16], sellable_shares, stop_loss_price, trade_id)
+    try:
+        def _place():
+            log.info("[STOP-LOSS-DEBUG] token_id type: %s | value: %s | len: %d", type(token_id), token_id, len(str(token_id)))
+            sell_args = OrderArgs(token_id=token_id, price=round(stop_loss_price, 2), size=float(sellable_shares), side=SELL)
+            log.info("[STOP-LOSS-DEBUG] OrderArgs token_id: %s | len: %d", sell_args.token_id, len(str(sell_args.token_id)))
+            signed = clob.create_order(sell_args)
+            return clob.post_order(signed, OrderType.GTC)
+
+        resp = await asyncio.wait_for(
+            loop.run_in_executor(None, _place),
+            timeout=10.0,
+        )
+
+        order_id = resp.get('orderID') or resp.get('id') if isinstance(resp, dict) else None
+        if order_id:
+            await db.update_stop_loss_order(p, trade_id, order_id, stop_loss_price)
+            log.info("[STOP-LOSS] GTC order placed for trade %d @ %.2f | order: %s", trade_id, stop_loss_price, order_id[:16])
+        else:
+            log.warning("[STOP-LOSS] No order ID returned for trade %d — no stop-loss active", trade_id)
+
+    except asyncio.TimeoutError:
+        log.error("[STOP-LOSS] Timeout placing stop-loss for trade %d — continuing without stop-loss", trade_id)
+    except Exception as e:
+        log.error("[STOP-LOSS] Full error for trade %d: %s: %s", trade_id, type(e).__name__, e)
+        log.error("[STOP-LOSS] Failed order args — token: %s | size: %s | price: %s | side: SELL",
+                  token_id[:16], shares, stop_loss_price)
+
+
+async def cancel_stop_loss_order(clob, p, trade_id: int, stop_loss_order_id: str) -> None:
+    """Cancel an existing GTC stop-loss order."""
+    try:
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: clob.cancel(stop_loss_order_id)),
+            timeout=10.0,
+        )
+        await db.mark_stop_loss_cancelled(p, trade_id)
+        log.info("[STOP-LOSS] Cancelled GTC order %s for trade %d", stop_loss_order_id[:16], trade_id)
+    except asyncio.TimeoutError:
+        log.error("[STOP-LOSS] Timeout cancelling stop-loss %s", stop_loss_order_id[:16])
+    except Exception as e:
+        log.warning("[STOP-LOSS] Could not cancel stop-loss %s: %s", stop_loss_order_id[:16], e)
 
 
 async def execute_trade(
     clob: ClobClient,
     market: db.MarketInfo,
     signal: Signal,
+    live_config: dict | None = None,
 ) -> None:
     """Place a trade based on a strategy signal. Records result to bot_trades."""
     _reset_daily_if_needed()
+    if live_config is None:
+        live_config = {}
 
     market_label = f"{market.market_type}:{market.market_id[:12]}"
 
     # ── Calculate dynamic bet size ─────────────────────────────────────
-    bet_size = round(config.BET_SIZE_USD * signal.confidence_multiplier, 2)
+    base_bet = float(live_config.get('bet_size_usd', str(config.BET_SIZE_USD)))
+    bet_size = round(base_bet * signal.confidence_multiplier, 2)
     bet_size = max(bet_size, 1.00)  # Polymarket minimum order
 
-    log.info(
-        "[CONFIDENCE] %s on %s — multiplier: %.1fx → bet: $%.2f",
-        signal.strategy_name, market.market_type,
-        signal.confidence_multiplier, bet_size,
-    )
+    if signal.strategy_name == 'momentum':
+        log.info(
+            "[MOMENTUM] Bet sizing — momentum: %.3f | multiplier: %.2fx | bet: $%.2f",
+            signal.signal_data.get('momentum_value', 0) if signal.signal_data else 0,
+            signal.confidence_multiplier, bet_size,
+        )
+    else:
+        log.info(
+            "[CONFIDENCE] %s on %s — multiplier: %.1fx → bet: $%.2f",
+            signal.strategy_name, market.market_type,
+            signal.confidence_multiplier, bet_size,
+        )
 
     # ── Dry-run mode ────────────────────────────────────────────────────
     if config.DRY_RUN:
@@ -164,8 +267,9 @@ async def execute_trade(
         return
 
     # ── Guard: daily loss limit ────────────────────────────────────────
-    if is_daily_limit_reached():
-        log.warning("Daily loss limit reached — net loss today: $%.2f / $%.2f", _daily_net_loss, config.DAILY_LOSS_LIMIT)
+    daily_limit = float(live_config.get('daily_loss_limit', str(config.DAILY_LOSS_LIMIT)))
+    if is_daily_limit_reached(daily_limit):
+        log.warning("Daily loss limit reached — net loss today: $%.2f / $%.2f", _daily_net_loss, daily_limit)
         await db.insert_bot_trade(
             market_id=market.market_id, market_type=market.market_type,
             strategy_name=signal.strategy_name, direction=signal.direction,
@@ -174,21 +278,21 @@ async def execute_trade(
             status="skipped_daily_limit", condition_id=market.market_id,
         )
         await db.log_event("trade_skipped",
-            f"Daily loss limit reached — net loss today: ${_daily_net_loss:.2f} / ${config.DAILY_LOSS_LIMIT:.2f}", {
+            f"Daily loss limit reached — net loss today: ${_daily_net_loss:.2f} / ${daily_limit:.2f}", {
                 "market_id": market.market_id,
                 "market_type": market.market_type,
                 "strategy_name": signal.strategy_name,
                 "direction": signal.direction,
                 "reason": "daily_limit",
                 "daily_net_loss": _daily_net_loss,
-                "daily_loss_limit": config.DAILY_LOSS_LIMIT,
+                "daily_loss_limit": daily_limit,
             })
         return
 
     # ── Guard: bankroll ─────────────────────────────────────────────────
     balance = await get_usdc_balance()
     if balance >= 0:
-        min_runway = config.BET_SIZE_USD * 2
+        min_runway = base_bet * 2
         if balance < min_runway:
             log.critical("Bankroll critically low ($%.2f < $%.2f) — bot paused", balance, min_runway)
             print(f"{Fore.RED}*** BANKROLL CRITICALLY LOW: ${balance:.2f} — bot paused ***{Style.RESET_ALL}")
@@ -214,11 +318,14 @@ async def execute_trade(
     # ── Resolve token IDs ───────────────────────────────────────────────
     up_token_id = market.up_token_id
     down_token_id = market.down_token_id
+    stop_loss_enabled = True
 
     if not up_token_id or not down_token_id:
         ids = _fetch_token_ids(clob, market.market_id)
         if ids is None:
-            log.warning("Cannot resolve token IDs for %s — skipping", market_label)
+            log.warning("[TOKENS] Could not resolve token IDs for %s — placing trade WITHOUT stop-loss", market_label)
+            stop_loss_enabled = False
+            # Cannot place trade without token IDs — still need them for the order
             await db.insert_bot_trade(
                 market_id=market.market_id, market_type=market.market_type,
                 strategy_name=signal.strategy_name, direction=signal.direction,
@@ -283,6 +390,13 @@ async def execute_trade(
         min_shares = math.ceil(MIN_DOLLAR_SIZE / rounded_price)
         if my_shares < min_shares:
             my_shares = min_shares
+
+        # Apply momentum_min_shares if configured
+        cfg_min_shares = int(live_config.get('momentum_min_shares', '0'))
+        if cfg_min_shares > 0 and my_shares < cfg_min_shares:
+            log.info("[BET-SIZE] Shares (%d) below min_shares (%d) — increasing to %d", my_shares, cfg_min_shares, cfg_min_shares)
+            my_shares = cfg_min_shares
+
         if my_shares < 1:
             log.warning("Cannot meet $1 minimum at price %.2f — skipping", rounded_price)
             await db.insert_bot_trade(
@@ -377,7 +491,7 @@ async def execute_trade(
                     "error": str(exc),
                 })
 
-    await db.insert_bot_trade(
+    trade_id = await db.insert_bot_trade(
         market_id=market.market_id,
         market_type=market.market_type,
         strategy_name=signal.strategy_name,
@@ -391,3 +505,17 @@ async def execute_trade(
         status=status,
         order_id=order_id,
     )
+
+    # Place stop-loss GTC order after confirmed fill
+    if status == "filled" and my_shares and trade_id and stop_loss_enabled:
+        stop_loss_key = f"{signal.strategy_name}_use_stop_loss"
+        exit_point_key = f"{signal.strategy_name}_stop_loss_exit_point"
+        use_stop_loss = live_config.get(stop_loss_key, 'false') == 'true'
+        if use_stop_loss:
+            sl_exit = float(live_config.get(exit_point_key, '0.40'))
+            log.info("[STOP-LOSS] Passing token_id to stop-loss: %s | direction: %s | this should be the %s token",
+                     token_id, signal.direction, signal.direction)
+            await place_stop_loss_order(
+                clob=clob, p=db.pool(), trade_id=trade_id,
+                token_id=token_id, shares=my_shares, stop_loss_price=sl_exit,
+            )

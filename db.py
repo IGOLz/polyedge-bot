@@ -86,10 +86,20 @@ CREATE TABLE IF NOT EXISTS bot_trades (
 """
 
 
+_CREATE_BOT_CONFIG = """
+CREATE TABLE IF NOT EXISTS bot_config (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+
 async def _create_tables() -> None:
     async with pool().acquire() as conn:
         await conn.execute(_CREATE_BOT_TRADES)
         await conn.execute(_CREATE_BOT_LOGS)
+        await conn.execute(_CREATE_BOT_CONFIG)
         # Add columns to existing tables (idempotent)
         await conn.execute("""
             ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS redeemed BOOLEAN NOT NULL DEFAULT FALSE
@@ -97,6 +107,66 @@ async def _create_tables() -> None:
         await conn.execute("""
             ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS confidence_multiplier NUMERIC(4,2) DEFAULT 1.0
         """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS stop_loss_order_id TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS stop_loss_price NUMERIC(6,4)
+        """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS stop_loss_triggered BOOLEAN DEFAULT FALSE
+        """)
+
+
+# ── Live config ────────────────────────────────────────────────────────
+
+async def seed_config_if_empty() -> None:
+    """Seed bot_config with .env defaults for any keys not already in the database."""
+    defaults = {
+        'STRATEGY_FARMING_ENABLED': str(config.STRATEGY_FARMING_ENABLED).lower(),
+        'STRATEGY_MOMENTUM_ENABLED': str(config.STRATEGY_MOMENTUM_ENABLED).lower(),
+        'STRATEGY_STREAK_ENABLED': str(config.STRATEGY_STREAK_ENABLED).lower(),
+        'STRATEGY_CALIBRATION_ENABLED': str(config.STRATEGY_CALIBRATION_ENABLED).lower(),
+        'STRATEGY_LATE_DIP_RECOVERY_ENABLED': str(config.STRATEGY_LATE_DIP_RECOVERY_ENABLED).lower(),
+        'BET_SIZE_USD': str(config.BET_SIZE_USD),
+        'DAILY_LOSS_LIMIT': str(config.DAILY_LOSS_LIMIT),
+        'FARMING_TRIGGER_POINT': str(config.FARMING_TRIGGER_POINT),
+        'FARMING_EXIT_POINT': str(config.FARMING_EXIT_POINT),
+        'FARMING_TRIGGER_MINUTES': str(config.FARMING_TRIGGER_MINUTES),
+        'MOMENTUM_MIN_THRESHOLD': str(config.MOMENTUM_MIN_THRESHOLD),
+        'MOMENTUM_USE_STOP_LOSS': 'true',
+        'MOMENTUM_EXIT_POINT': '0.50',
+        'STREAK_LENGTH': str(config.STREAK_LENGTH),
+        'STREAK_DIRECTION': config.STREAK_DIRECTION,
+        'FARMING_USE_STOP_LOSS': 'true',
+        'LATE_DIP_USE_STOP_LOSS': 'true',
+        'LATE_DIP_EXIT_POINT': '0.35',
+        'momentum_multiplier_weak_threshold': '0.03',
+        'momentum_multiplier_strong_threshold': '0.07',
+        'momentum_multiplier_weak': '0.67',
+        'momentum_multiplier_base': '1.0',
+        'momentum_multiplier_strong': '1.5',
+        'momentum_multiplier_very_strong': '2.0',
+        'momentum_multiplier_price_penalty': 'true',
+        'momentum_multiplier_price_penalty_threshold': '0.70',
+        'momentum_multiplier_price_penalty_factor': '0.5',
+        'momentum_min_shares': '0',
+    }
+    async with pool().acquire() as conn:
+        for key, value in defaults.items():
+            await conn.execute("""
+                INSERT INTO bot_config (key, value)
+                VALUES ($1, $2)
+                ON CONFLICT (key) DO NOTHING
+            """, key.lower(), value)
+    log.info("[CONFIG] Bot config loaded from database — database is source of truth")
+
+
+async def get_live_config() -> dict[str, str]:
+    """Read all key-value pairs from bot_config."""
+    async with pool().acquire() as conn:
+        rows = await conn.fetch("SELECT key, value FROM bot_config")
+        return {row['key'].lower(): row['value'] for row in rows}
 
 
 # ── Data classes ────────────────────────────────────────────────────────
@@ -319,7 +389,7 @@ async def update_bot_trade_outcome(trade_id: int, outcome: str, pnl: float) -> N
         """, outcome, Decimal(str(round(pnl, 2))), trade_id)
 
 
-async def update_pending_outcomes() -> None:
+async def update_pending_outcomes(clob=None) -> None:
     """Bulk-resolve filled bot_trades by joining against market_outcomes."""
     async with pool().acquire() as conn:
         await conn.execute("""
@@ -344,6 +414,61 @@ async def update_pending_outcomes() -> None:
             AND bt.final_outcome IS NULL
             AND mo.resolved = TRUE
             AND mo.final_outcome IS NOT NULL
+        """)
+
+    # Cancel stop-loss orders for just-resolved trades
+    if clob:
+        from executor import cancel_stop_loss_order
+        async with pool().acquire() as conn:
+            resolved_with_sl = await conn.fetch("""
+                SELECT id, stop_loss_order_id
+                FROM bot_trades
+                WHERE stop_loss_order_id IS NOT NULL
+                AND stop_loss_triggered = FALSE
+                AND final_outcome IS NOT NULL
+                AND status = 'filled'
+            """)
+        for trade in resolved_with_sl:
+            await cancel_stop_loss_order(clob, pool(), trade['id'], trade['stop_loss_order_id'])
+
+
+# ── Stop-loss helpers ──────────────────────────────────────────────────
+
+async def update_stop_loss_order(p, trade_id: int, order_id: str, stop_loss_price: float) -> None:
+    async with p.acquire() as conn:
+        await conn.execute("""
+            UPDATE bot_trades
+            SET stop_loss_order_id = $1, stop_loss_price = $2
+            WHERE id = $3
+        """, order_id, Decimal(str(round(stop_loss_price, 4))), trade_id)
+
+
+async def mark_stop_loss_triggered(p, trade_id: int) -> None:
+    async with p.acquire() as conn:
+        await conn.execute("""
+            UPDATE bot_trades
+            SET stop_loss_triggered = TRUE, final_outcome = 'stop_loss'
+            WHERE id = $1
+        """, trade_id)
+
+
+async def mark_stop_loss_cancelled(p, trade_id: int) -> None:
+    async with p.acquire() as conn:
+        await conn.execute("""
+            UPDATE bot_trades SET stop_loss_order_id = NULL
+            WHERE id = $1
+        """, trade_id)
+
+
+async def get_open_stop_loss_orders(p) -> list:
+    async with p.acquire() as conn:
+        return await conn.fetch("""
+            SELECT id, market_id, stop_loss_order_id, token_id, direction, entry_price
+            FROM bot_trades
+            WHERE stop_loss_order_id IS NOT NULL
+            AND stop_loss_triggered = FALSE
+            AND final_outcome IS NULL
+            AND status = 'filled'
         """)
 
 
