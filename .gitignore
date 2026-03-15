@@ -1,6 +1,7 @@
 .env
 *.db
 bot.log
+*.log
 stats.json
 __pycache__/
 *.pyc
