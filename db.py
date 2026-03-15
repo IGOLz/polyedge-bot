@@ -214,6 +214,21 @@ async def get_calibration_deviation(market_type: str, bucket: float) -> float | 
     return float(row["deviation"])
 
 
+async def get_average_price_between(market_id: str, started_at: datetime, from_second: int, to_second: int) -> float | None:
+    """Get average up_price between from_second and to_second after market start."""
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT AVG(up_price) as avg_price
+            FROM market_ticks
+            WHERE market_id = $1
+            AND time >= $2 + ($3 * INTERVAL '1 second')
+            AND time <= $2 + ($4 * INTERVAL '1 second')
+        """, market_id, started_at, from_second, to_second)
+        if row and row['avg_price'] is not None:
+            return float(row['avg_price'])
+        return None
+
+
 async def already_traded_this_market(market_id: str, strategy_name: str | None = None) -> bool:
     """Check if we already placed a trade on this market (optionally per-strategy)."""
     async with pool().acquire() as conn:

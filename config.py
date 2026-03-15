@@ -42,6 +42,7 @@ STRATEGY_FARMING_ENABLED: bool = os.getenv("STRATEGY_FARMING_ENABLED", "true").l
 STRATEGY_CALIBRATION_ENABLED: bool = os.getenv("STRATEGY_CALIBRATION_ENABLED", "false").lower() == "true"
 STRATEGY_MOMENTUM_ENABLED: bool = os.getenv("STRATEGY_MOMENTUM_ENABLED", "true").lower() == "true"
 STRATEGY_STREAK_ENABLED: bool = os.getenv("STRATEGY_STREAK_ENABLED", "false").lower() == "true"
+STRATEGY_LATE_DIP_RECOVERY_ENABLED: bool = os.getenv("STRATEGY_LATE_DIP_RECOVERY_ENABLED", "true").lower() == "true"
 
 # ── Strategy parameters (best backtest configs) ─────────────────────────
 FARMING_TRIGGER_POINT: float = float(os.getenv("FARMING_TRIGGER_POINT", "0.65"))

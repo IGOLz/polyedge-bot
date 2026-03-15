@@ -149,6 +149,56 @@ async def evaluate_calibration(market: db.MarketInfo) -> Signal | None:
     return None
 
 
+async def evaluate_late_dip_recovery(market: db.MarketInfo) -> Signal | None:
+    """Late dip recovery: buy Up when a strong uptrend dips late in a 15m window."""
+    # Only 15m markets
+    if '5m' in market.market_type:
+        return None
+
+    now = datetime.now(timezone.utc)
+    seconds_elapsed = (now - market.started_at).total_seconds()
+
+    # Only activate between minute 10 and minute 14
+    if seconds_elapsed < 600:
+        return None
+    if seconds_elapsed > 840:
+        return None
+
+    current_price = await db.get_latest_price(market.market_id)
+    if current_price is None:
+        return None
+
+    # Get the average price between minute 5 and minute 10
+    avg_price_5_to_10 = await db.get_average_price_between(
+        market.market_id, market.started_at, 300, 600
+    )
+    if avg_price_5_to_10 is None:
+        return None
+
+    # Market must have been clearly Up during minutes 5-10
+    if avg_price_5_to_10 < 0.65:
+        return None
+
+    # Current price must have dropped significantly
+    drop = avg_price_5_to_10 - current_price
+    if drop < 0.20:
+        return None
+
+    # Must actually be in a dip
+    if current_price > 0.55:
+        return None
+
+    log.info("[CONFIDENCE] late_dip_recovery on %s — avg_5_10: %.2f, current: %.2f, drop: %.2f",
+             market.market_type, avg_price_5_to_10, current_price, drop)
+
+    return Signal('Up', 'late_dip_recovery', current_price, signal_data={
+        'avg_price_5_to_10': avg_price_5_to_10,
+        'current_price': current_price,
+        'drop': round(drop, 4),
+        'seconds_elapsed': seconds_elapsed,
+    })
+
+
 def calculate_confidence(signal_type: str, signal_data: dict) -> float:
     """
     Returns a multiplier between BET_SIZE_MIN_MULTIPLIER and BET_SIZE_MAX_MULTIPLIER.
@@ -192,6 +242,11 @@ def calculate_confidence(signal_type: str, signal_data: dict) -> float:
         deviation_score = min(deviation / 0.15, 1.0)
         confidence = deviation_score
 
+    elif signal_type == 'late_dip_recovery':
+        drop = signal_data.get('drop', 0.20)
+        drop_score = min(drop / 0.40, 1.0)
+        confidence = 0.5 + (drop_score * 0.5)
+
     else:
         confidence = 0.5
 
@@ -218,6 +273,8 @@ async def evaluate_strategies(market: db.MarketInfo) -> Signal | None:
         strategies.append(("calibration", evaluate_calibration))
     if config.STRATEGY_FARMING_ENABLED:
         strategies.append(("farming", evaluate_farming))
+    if config.STRATEGY_LATE_DIP_RECOVERY_ENABLED:
+        strategies.append(("late_dip_recovery", evaluate_late_dip_recovery))
 
     for name, evaluate_fn in strategies:
         if not await db.already_traded_this_market(market.market_id, name):
