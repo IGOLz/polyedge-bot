@@ -8,7 +8,9 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
+from datetime import datetime, timedelta
 from typing import Any
 
 from eth_abi import encode
@@ -28,6 +30,9 @@ RELAYER_URL = os.getenv("POLYMARKET_RELAYER_URL", "https://relayer-v2.polymarket
 CHAIN_ID = 137
 
 REDEEM_INTERVAL = 5 * 60  # 5 minutes
+
+# Track rate-limited conditions: condition_id -> timestamp when to retry
+_rate_limited_until: dict[str, float] = {}
 
 # redeemPositions(address,bytes32,bytes32,uint256[]) selector
 _REDEEM_SELECTOR = Web3.keccak(
@@ -319,6 +324,11 @@ async def _redeem_cycle() -> None:
 
     async with config.get_http_client() as client:
         for condition_id, fill in seen.items():
+            if condition_id in _rate_limited_until:
+                if time.time() < _rate_limited_until[condition_id]:
+                    continue  # skip until quota resets
+                del _rate_limited_until[condition_id]
+
             try:
                 amount = await redeem_condition(
                     client,
@@ -339,9 +349,20 @@ async def _redeem_cycle() -> None:
                         },
                     )
             except Exception as exc:
+                if '429' in str(exc) or 'quota exceeded' in str(exc):
+                    match = re.search(r'resets in (\d+) seconds', str(exc))
+                    if match:
+                        reset_seconds = int(match.group(1))
+                        reset_time = datetime.utcnow() + timedelta(seconds=reset_seconds)
+                        log.warning(f"[REDEEM] Rate limit hit — quota resets at {reset_time.strftime('%H:%M UTC')} (in {reset_seconds // 60} minutes)")
+                        _rate_limited_until[condition_id] = time.time() + reset_seconds + 60  # +60s buffer
+                    else:
+                        log.warning("[REDEEM] Rate limit hit — unknown reset time")
+                        _rate_limited_until[condition_id] = time.time() + 7500
+                    break  # stop trying, wait for next cycle
                 log.error("[REDEEM] Failed %s: %s", condition_id[:10], exc)
 
-            await asyncio.sleep(10)
+            await asyncio.sleep(10)  # wait 10 seconds between each redemption
 
 
 async def redemption_loop() -> None:

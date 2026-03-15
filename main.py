@@ -261,8 +261,8 @@ async def run() -> None:
 
 
             for market in active_markets:
-                signal = await evaluate_strategies(market, live_config)
-                if signal:
+                signals = await evaluate_strategies(market, live_config)
+                for signal in signals:
                     await execute_trade(clob, market, signal, live_config)
 
             backoff = 0  # reset on success

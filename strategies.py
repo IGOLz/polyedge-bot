@@ -65,89 +65,91 @@ async def evaluate_farming(market: db.MarketInfo, live_config: dict) -> Signal |
     return None
 
 
-def calculate_momentum_multiplier(momentum_value: float, entry_price: float, live_config: dict) -> float:
-    """Calculate bet size multiplier for momentum based on signal strength and price centrality."""
-    weak_threshold = float(live_config.get('momentum_multiplier_weak_threshold', '0.03'))
-    strong_threshold = float(live_config.get('momentum_multiplier_strong_threshold', '0.07'))
-    mult_weak = float(live_config.get('momentum_multiplier_weak', '0.67'))
-    mult_base = float(live_config.get('momentum_multiplier_base', '1.0'))
-    mult_strong = float(live_config.get('momentum_multiplier_strong', '1.5'))
-    mult_very_strong = float(live_config.get('momentum_multiplier_very_strong', '2.0'))
-    use_price_penalty = live_config.get('momentum_multiplier_price_penalty', 'true') == 'true'
-    penalty_threshold = float(live_config.get('momentum_multiplier_price_penalty_threshold', '0.70'))
-    penalty_factor = float(live_config.get('momentum_multiplier_price_penalty_factor', '0.5'))
-
-    # Determine base multiplier from momentum strength
-    abs_momentum = abs(momentum_value)
-    if abs_momentum < weak_threshold:
-        multiplier = mult_weak
-    elif abs_momentum < strong_threshold:
-        multiplier = mult_base
-    elif abs_momentum < strong_threshold * 1.5:
-        multiplier = mult_strong
-    else:
-        multiplier = mult_very_strong
-
-    # Apply price penalty at extreme prices
-    if use_price_penalty:
-        distance_from_center = abs(entry_price - 0.5)
-        if distance_from_center > (penalty_threshold - 0.5):
-            multiplier = multiplier * penalty_factor
-
-    # Round to nearest 0.25 for clean bet sizes
-    multiplier = round(multiplier * 4) / 4
-    return max(multiplier, 0.5)
-
-
-async def evaluate_momentum(market: db.MarketInfo, live_config: dict) -> Signal | None:
-    """Momentum: bet in the direction of early price movement."""
+async def evaluate_momentum_tier(market: db.MarketInfo, live_config: dict, tier: str) -> Signal | None:
+    """Momentum tier: evaluate a single momentum tier (broad/filtered/aggressive)."""
     if '15m' in market.market_type:
         return None
 
+    prefix = f'momentum_{tier}_'
+
+    # --- Read all tier parameters from live_config ---
+    price_a_seconds = int(live_config.get(f'{prefix}price_a_seconds', '45'))
+    price_b_seconds = int(live_config.get(f'{prefix}price_b_seconds', '90'))
+    entry_after_seconds = int(live_config.get(f'{prefix}entry_after_seconds', '95'))
+    entry_until_seconds = int(live_config.get(f'{prefix}entry_until_seconds', '120'))
+    threshold = float(live_config.get(f'{prefix}threshold', '0.03'))
+    price_min = float(live_config.get(f'{prefix}price_min', '0.40'))
+    price_max = float(live_config.get(f'{prefix}price_max', '0.75'))
+    direction_filter = live_config.get(f'{prefix}direction', 'both')
+    markets_filter = live_config.get(f'{prefix}markets', 'all')
+    hours_start = int(live_config.get(f'{prefix}hours_start', '8'))
+    hours_end = int(live_config.get(f'{prefix}hours_end', '24'))
+    bet_size = float(live_config.get(f'{prefix}bet_size', '1.0'))
+    stop_loss_price = float(live_config.get(f'{prefix}stop_loss_price', '0.35'))
+    stop_loss_enabled = live_config.get(f'{prefix}stop_loss_enabled', 'false') == 'true'
+
+    # 1. Market type filter
+    if markets_filter == 'no_btc' and 'btc' in market.market_type:
+        return None
+    if markets_filter == 'xrp_sol_only':
+        if 'xrp' not in market.market_type and 'sol' not in market.market_type:
+            return None
+
+    # 2. Hour filter
+    current_hour = datetime.now(timezone.utc).hour
+    if current_hour < hours_start or current_hour >= hours_end:
+        return None
+
+    # 3. Timing window
     now = datetime.now(timezone.utc)
     seconds_elapsed = (now - market.started_at).total_seconds()
-
-    # Only evaluate momentum between second 61 and second 120
-    # Before 61: signal not ready yet (need price_60s)
-    # After 120: signal is stale, market has moved on
-    if seconds_elapsed < 31 or seconds_elapsed > 90:
-
-
+    if seconds_elapsed < entry_after_seconds or seconds_elapsed > entry_until_seconds:
         return None
 
-    price_30s = await db.get_price_at_second(market.market_id, market.started_at, 30)
-    price_60s = await db.get_price_at_second(market.market_id, market.started_at, 60)
-
-    if price_30s is None or price_60s is None:
+    # 4. Fetch price samples
+    price_a = await db.get_price_at_second(market.market_id, market.started_at, price_a_seconds)
+    price_b = await db.get_price_at_second(market.market_id, market.started_at, price_b_seconds)
+    if price_a is None or price_b is None:
         return None
 
-    momentum = price_60s - price_30s
+    # 5. Calculate momentum
+    momentum = price_b - price_a
 
-    sig_data = {
-        "price_30s": price_30s,
-        "price_60s": price_60s,
-        "momentum_value": round(momentum, 6),
-    }
+    # 6. Direction filter and signal creation
+    if momentum >= threshold and direction_filter in ('both', 'up_only'):
+        entry_price = price_b
+        direction = 'Up'
+    elif momentum <= -threshold and direction_filter in ('both', 'down_only'):
+        entry_price = 1 - price_b
+        direction = 'Down'
+    else:
+        return None
 
-    min_threshold = float(live_config.get('momentum_min_threshold', str(config.MOMENTUM_MIN_THRESHOLD)))
-    use_stop_loss = live_config.get('momentum_use_stop_loss', 'true') == 'true'
-    exit_point = float(live_config.get('momentum_exit_point', '0.50'))
+    # 7. Entry price range filter
+    if entry_price < price_min or entry_price > price_max:
+        return None
 
-    if momentum >= min_threshold:
-        if use_stop_loss and price_60s < exit_point:
-            return None
-        multiplier = calculate_momentum_multiplier(momentum, price_60s, live_config)
-        sig_data["confidence_multiplier"] = multiplier
-        return Signal("Up", "momentum", price_60s, sig_data)
-    if momentum <= -min_threshold:
-        if use_stop_loss and (1 - price_60s) > (1 - exit_point):
-            return None
-        entry_price = 1 - price_60s
-        multiplier = calculate_momentum_multiplier(momentum, entry_price, live_config)
-        sig_data["confidence_multiplier"] = multiplier
-        return Signal("Down", "momentum", entry_price, sig_data)
+    # 8. Stop-loss logic — only attach if enabled AND bet_size >= $5 platform minimum
+    stop_loss_active = stop_loss_enabled and bet_size >= 5.0
 
-    return None
+    # 9. Return signal
+    return Signal(
+        direction=direction,
+        strategy_name=f'momentum_{tier}',
+        entry_price=entry_price,
+        signal_data={
+            'tier': tier,
+            'price_a_seconds': price_a_seconds,
+            'price_b_seconds': price_b_seconds,
+            'price_a': price_a,
+            'price_b': price_b,
+            'momentum_value': round(momentum, 6),
+            'entry_price': entry_price,
+            'seconds_elapsed': round(seconds_elapsed, 1),
+            'stop_loss_price': stop_loss_price if stop_loss_active else None,
+            'bet_size': bet_size,
+        }
+    )
 
 
 async def evaluate_streak(market: db.MarketInfo, live_config: dict) -> Signal | None:
@@ -280,9 +282,9 @@ def calculate_confidence(signal_type: str, signal_data: dict, live_config: dict)
     Returns a multiplier between BET_SIZE_MIN_MULTIPLIER and BET_SIZE_MAX_MULTIPLIER.
     Higher = more confident = bigger bet.
     """
-    if signal_type == 'momentum':
-        # Momentum uses its own configurable multiplier system
-        return signal_data.get('confidence_multiplier', 1.0)
+    if signal_type.startswith('momentum_'):
+        # Momentum tiers use fixed bet_size per tier, no confidence multiplier
+        return 1.0
 
     elif signal_type == 'farming':
         entry_price = signal_data.get('entry_price', 0.65)
@@ -327,22 +329,36 @@ def calculate_confidence(signal_type: str, signal_data: dict, live_config: dict)
     return multiplier
 
 
-async def evaluate_strategies(market: db.MarketInfo, live_config: dict) -> Signal | None:
-    """Try each enabled strategy in priority order. Return first signal found."""
+async def evaluate_strategies(market: db.MarketInfo, live_config: dict) -> list[Signal]:
+    """Evaluate all enabled strategies. Momentum tiers fire independently; others use first-match."""
 
-    strategies = []
-    if live_config.get('strategy_momentum_enabled', 'false') == 'true':
-        strategies.append(("momentum", evaluate_momentum))
+    # --- Momentum tiers: all enabled tiers evaluated independently ---
+    momentum_signals = []
+    for tier in ('broad', 'filtered', 'aggressive'):
+        if live_config.get(f'strategy_momentum_{tier}_enabled', 'false') == 'true':
+            if not await db.already_traded_this_market(market.market_id, f'momentum_{tier}'):
+                signal = await evaluate_momentum_tier(market, live_config, tier)
+                if signal:
+                    signal.confidence_multiplier = 1.0
+                    log.info("Signal: %s %s on %s (price=%.4f, tier=%s, bet=$%.2f)",
+                             signal.strategy_name, signal.direction,
+                             market.market_id[:16], signal.entry_price,
+                             tier, signal.signal_data.get('bet_size', 0))
+                    momentum_signals.append(signal)
+
+    # --- Other strategies: first-match behavior ---
+    other_strategies = []
     if live_config.get('strategy_streak_enabled', 'false') == 'true':
-        strategies.append(("streak", evaluate_streak))
+        other_strategies.append(("streak", evaluate_streak))
     if live_config.get('strategy_calibration_enabled', 'false') == 'true':
-        strategies.append(("calibration", evaluate_calibration))
+        other_strategies.append(("calibration", evaluate_calibration))
     if live_config.get('strategy_farming_enabled', 'false') == 'true':
-        strategies.append(("farming", evaluate_farming))
+        other_strategies.append(("farming", evaluate_farming))
     if live_config.get('strategy_late_dip_recovery_enabled', 'false') == 'true':
-        strategies.append(("late_dip_recovery", evaluate_late_dip_recovery))
+        other_strategies.append(("late_dip_recovery", evaluate_late_dip_recovery))
 
-    for name, evaluate_fn in strategies:
+    other_signal = None
+    for name, evaluate_fn in other_strategies:
         if not await db.already_traded_this_market(market.market_id, name):
             signal = await evaluate_fn(market, live_config)
             if signal:
@@ -353,6 +369,12 @@ async def evaluate_strategies(market: db.MarketInfo, live_config: dict) -> Signa
                          signal.strategy_name, signal.direction,
                          market.market_id[:16], signal.entry_price,
                          signal.confidence_multiplier)
-                return signal
+                other_signal = signal
+                break
 
-    return None
+    # Combine: all momentum signals + at most one other strategy signal
+    signals = momentum_signals
+    if other_signal:
+        signals.append(other_signal)
+
+    return signals
