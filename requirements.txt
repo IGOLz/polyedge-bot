@@ -1,0 +1,9 @@
+py-clob-client>=0.0.1
+httpx[socks]>=0.27.0
+python-dotenv>=1.0.0
+asyncpg>=0.29.0
+colorama>=0.4.6
+web3>=6.0.0
+eth-abi>=4.0.0
+eth-account>=0.10.0
+eth-keys>=0.4.0
