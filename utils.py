@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 
 
@@ -11,13 +12,15 @@ def setup_logging() -> logging.Logger:
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.INFO)
     console.setFormatter(fmt)
-
-    file_handler = logging.FileHandler("bot.log", encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(fmt)
-
     logger.addHandler(console)
-    logger.addHandler(file_handler)
+
+    # Only add file handler when not in Docker
+    if not os.path.exists("/.dockerenv"):
+        file_handler = logging.FileHandler("bot.log", encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(fmt)
+        logger.addHandler(file_handler)
+
     return logger
 
 
