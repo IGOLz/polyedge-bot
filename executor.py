@@ -223,17 +223,20 @@ async def execute_trade(
     market_label = f"{market.market_type}:{market.market_id[:12]}"
 
     # ── Calculate dynamic bet size ─────────────────────────────────────
-    base_bet = float(live_config.get('bet_size_usd', str(config.BET_SIZE_USD)))
-    bet_size = round(base_bet * signal.confidence_multiplier, 2)
-    bet_size = max(bet_size, 1.00)  # Polymarket minimum order
-
-    if signal.strategy_name == 'momentum':
+    if signal.strategy_name.startswith('momentum_') and signal.signal_data.get('bet_size'):
+        # Momentum tiers use fixed per-tier bet size, not global base * multiplier
+        bet_size = round(float(signal.signal_data['bet_size']), 2)
+        bet_size = max(bet_size, 1.00)
         log.info(
-            "[MOMENTUM] Bet sizing — momentum: %.3f | multiplier: %.2fx | bet: $%.2f",
-            signal.signal_data.get('momentum_value', 0) if signal.signal_data else 0,
-            signal.confidence_multiplier, bet_size,
+            "[MOMENTUM] Bet sizing — tier: %s | momentum: %.3f | bet: $%.2f",
+            signal.signal_data.get('tier', '?'),
+            signal.signal_data.get('momentum_value', 0),
+            bet_size,
         )
     else:
+        base_bet = float(live_config.get('bet_size_usd', str(config.BET_SIZE_USD)))
+        bet_size = round(base_bet * signal.confidence_multiplier, 2)
+        bet_size = max(bet_size, 1.00)  # Polymarket minimum order
         log.info(
             "[CONFIDENCE] %s on %s — multiplier: %.1fx → bet: $%.2f",
             signal.strategy_name, market.market_type,
@@ -292,7 +295,7 @@ async def execute_trade(
     # ── Guard: bankroll ─────────────────────────────────────────────────
     balance = await get_usdc_balance()
     if balance >= 0:
-        min_runway = base_bet * 2
+        min_runway = bet_size * 2
         if balance < min_runway:
             log.critical("Bankroll critically low ($%.2f < $%.2f) — bot paused", balance, min_runway)
             print(f"{Fore.RED}*** BANKROLL CRITICALLY LOW: ${balance:.2f} — bot paused ***{Style.RESET_ALL}")
@@ -508,14 +511,25 @@ async def execute_trade(
 
     # Place stop-loss GTC order after confirmed fill
     if status == "filled" and my_shares and trade_id and stop_loss_enabled:
-        stop_loss_key = f"{signal.strategy_name}_use_stop_loss"
-        exit_point_key = f"{signal.strategy_name}_stop_loss_exit_point"
-        use_stop_loss = live_config.get(stop_loss_key, 'false') == 'true'
-        if use_stop_loss:
-            sl_exit = float(live_config.get(exit_point_key, '0.40'))
-            log.info("[STOP-LOSS] Passing token_id to stop-loss: %s | direction: %s | this should be the %s token",
-                     token_id, signal.direction, signal.direction)
+        # Momentum tiers carry stop-loss price in signal_data (None if not active)
+        if signal.strategy_name.startswith('momentum_') and signal.signal_data.get('stop_loss_price') is not None:
+            sl_exit = float(signal.signal_data['stop_loss_price'])
+            log.info("[STOP-LOSS] Momentum tier %s — placing stop-loss @ %.2f | token: %s | direction: %s",
+                     signal.signal_data.get('tier', '?'), sl_exit, token_id[:16], signal.direction)
             await place_stop_loss_order(
                 clob=clob, p=db.pool(), trade_id=trade_id,
                 token_id=token_id, shares=my_shares, stop_loss_price=sl_exit,
             )
+        else:
+            # Other strategies: use legacy config key pattern
+            stop_loss_key = f"{signal.strategy_name}_use_stop_loss"
+            exit_point_key = f"{signal.strategy_name}_stop_loss_exit_point"
+            use_stop_loss = live_config.get(stop_loss_key, 'false') == 'true'
+            if use_stop_loss:
+                sl_exit = float(live_config.get(exit_point_key, '0.40'))
+                log.info("[STOP-LOSS] Passing token_id to stop-loss: %s | direction: %s | this should be the %s token",
+                         token_id, signal.direction, signal.direction)
+                await place_stop_loss_order(
+                    clob=clob, p=db.pool(), trade_id=trade_id,
+                    token_id=token_id, shares=my_shares, stop_loss_price=sl_exit,
+                )
