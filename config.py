@@ -38,33 +38,10 @@ POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "")
 POSTGRES_DB: str = os.getenv("POSTGRES_DB", "polymarket_tracker")
 
 # ── Strategy toggles ────────────────────────────────────────────────────
-STRATEGY_FARMING_ENABLED: bool = os.getenv("STRATEGY_FARMING_ENABLED", "true").lower() == "true"
-STRATEGY_CALIBRATION_ENABLED: bool = os.getenv("STRATEGY_CALIBRATION_ENABLED", "false").lower() == "true"
 STRATEGY_MOMENTUM_ENABLED: bool = os.getenv("STRATEGY_MOMENTUM_ENABLED", "true").lower() == "true"
-STRATEGY_STREAK_ENABLED: bool = os.getenv("STRATEGY_STREAK_ENABLED", "false").lower() == "true"
-STRATEGY_LATE_DIP_RECOVERY_ENABLED: bool = os.getenv("STRATEGY_LATE_DIP_RECOVERY_ENABLED", "true").lower() == "true"
-
-# ── Strategy parameters (best backtest configs) ─────────────────────────
-FARMING_TRIGGER_POINT: float = float(os.getenv("FARMING_TRIGGER_POINT", "0.65"))
-FARMING_EXIT_POINT: float = float(os.getenv("FARMING_EXIT_POINT", "0.30"))
-FARMING_TRIGGER_MINUTES: int = int(os.getenv("FARMING_TRIGGER_MINUTES", "1"))
-
-MOMENTUM_MIN_THRESHOLD: float = float(os.getenv("MOMENTUM_MIN_THRESHOLD", "0.02"))
-MOMENTUM_USE_STOP_LOSS: bool = os.getenv("MOMENTUM_USE_STOP_LOSS", "false").lower() == "true"
-MOMENTUM_EXIT_POINT: float = float(os.getenv("MOMENTUM_EXIT_POINT", "0.40"))
-
-STREAK_LENGTH: int = int(os.getenv("STREAK_LENGTH", "3"))
-STREAK_DIRECTION: str = os.getenv("STREAK_DIRECTION", "both")
-
-CALIBRATION_MAX_ENTRY_SECONDS: int = int(os.getenv("CALIBRATION_MAX_ENTRY_SECONDS", "60"))
-CALIBRATION_ENTRY_LOW: float = float(os.getenv("CALIBRATION_ENTRY_LOW", "0.50"))
-CALIBRATION_ENTRY_HIGH: float = float(os.getenv("CALIBRATION_ENTRY_HIGH", "0.60"))
-CALIBRATION_MIN_DEVIATION: float = float(os.getenv("CALIBRATION_MIN_DEVIATION", "0.05"))
 
 # ── Betting ──────────────────────────────────────────────────────────────
 BET_SIZE_USD: float = float(os.getenv("BET_SIZE_USD", "1.5"))
-BET_SIZE_MIN_MULTIPLIER: float = float(os.getenv("BET_SIZE_MIN_MULTIPLIER", "0.5"))
-BET_SIZE_MAX_MULTIPLIER: float = float(os.getenv("BET_SIZE_MAX_MULTIPLIER", "2.0"))
 DAILY_LOSS_LIMIT: float = float(os.getenv("DAILY_LOSS_LIMIT", "30.0"))
 LOOP_INTERVAL: int = int(os.getenv("LOOP_INTERVAL", "5"))
 

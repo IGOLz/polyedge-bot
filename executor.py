@@ -222,40 +222,31 @@ async def execute_trade(
 
     market_label = f"{market.market_type}:{market.market_id[:12]}"
 
-    # ── Calculate dynamic bet size ─────────────────────────────────────
-    if signal.strategy_name.startswith('momentum_') and signal.signal_data.get('bet_size'):
-        # Momentum tiers use fixed per-tier bet size, not global base * multiplier
-        bet_size = round(float(signal.signal_data['bet_size']), 2)
+    # ── Calculate bet size from signal ──────────────────────────────────
+    if signal.signal_data.get('bet_cost'):
+        bet_size = round(float(signal.signal_data['bet_cost']), 2)
         bet_size = max(bet_size, 1.00)
-        log.info(
-            "[MOMENTUM] Bet sizing — tier: %s | momentum: %.3f | bet: $%.2f",
-            signal.signal_data.get('tier', '?'),
-            signal.signal_data.get('momentum_value', 0),
-            bet_size,
-        )
     else:
         base_bet = float(live_config.get('bet_size_usd', str(config.BET_SIZE_USD)))
-        bet_size = round(base_bet * signal.confidence_multiplier, 2)
-        bet_size = max(bet_size, 1.00)  # Polymarket minimum order
-        log.info(
-            "[CONFIDENCE] %s on %s — multiplier: %.1fx → bet: $%.2f",
-            signal.strategy_name, market.market_type,
-            signal.confidence_multiplier, bet_size,
-        )
+        bet_size = max(round(base_bet, 2), 1.00)
+    log.info(
+        "[BET] %s on %s — $%.2f (%d shares)",
+        signal.strategy_name, market.market_type,
+        bet_size, signal.signal_data.get('shares', 0),
+    )
 
     # ── Dry-run mode ────────────────────────────────────────────────────
     if config.DRY_RUN:
         log.info(
-            "[DRY RUN] Would place BUY %s on %s at %.4f — strategy: %s (%.1fx → $%.2f)",
+            "[DRY RUN] Would place BUY %s on %s at %.4f — strategy: %s ($%.2f)",
             signal.direction, market_label, signal.entry_price,
-            signal.strategy_name, signal.confidence_multiplier, bet_size,
+            signal.strategy_name, bet_size,
         )
-        print(f"{Fore.YELLOW}[DRY RUN] Would place BUY {signal.direction} on {market_label} at {signal.entry_price:.4f} — strategy: {signal.strategy_name} ({signal.confidence_multiplier:.1f}x → ${bet_size:.2f}){Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}[DRY RUN] Would place BUY {signal.direction} on {market_label} at {signal.entry_price:.4f} — strategy: {signal.strategy_name} (${bet_size:.2f}){Style.RESET_ALL}")
         await db.insert_bot_trade(
             market_id=market.market_id, market_type=market.market_type,
             strategy_name=signal.strategy_name, direction=signal.direction,
             entry_price=signal.entry_price, bet_size_usd=bet_size,
-            confidence_multiplier=signal.confidence_multiplier,
             status="dry_run", condition_id=market.market_id,
         )
         await db.log_event("trade_dry_run",
@@ -277,7 +268,6 @@ async def execute_trade(
             market_id=market.market_id, market_type=market.market_type,
             strategy_name=signal.strategy_name, direction=signal.direction,
             entry_price=signal.entry_price, bet_size_usd=bet_size,
-            confidence_multiplier=signal.confidence_multiplier,
             status="skipped_daily_limit", condition_id=market.market_id,
         )
         await db.log_event("trade_skipped",
@@ -303,7 +293,6 @@ async def execute_trade(
                 market_id=market.market_id, market_type=market.market_type,
                 strategy_name=signal.strategy_name, direction=signal.direction,
                 entry_price=signal.entry_price, bet_size_usd=bet_size,
-                confidence_multiplier=signal.confidence_multiplier,
                 status="skipped_bankroll", condition_id=market.market_id,
             )
             await db.log_event("trade_skipped",
@@ -333,7 +322,6 @@ async def execute_trade(
                 market_id=market.market_id, market_type=market.market_type,
                 strategy_name=signal.strategy_name, direction=signal.direction,
                 entry_price=signal.entry_price, bet_size_usd=bet_size,
-                confidence_multiplier=signal.confidence_multiplier,
                 status="error", condition_id=market.market_id,
                 notes="Failed to resolve token IDs",
             )
@@ -356,7 +344,6 @@ async def execute_trade(
             market_id=market.market_id, market_type=market.market_type,
             strategy_name=signal.strategy_name, direction=signal.direction,
             entry_price=signal.entry_price, bet_size_usd=bet_size,
-            confidence_multiplier=signal.confidence_multiplier,
             token_id=token_id, condition_id=market.market_id,
             status="error", notes="No liquidity",
         )
@@ -374,6 +361,7 @@ async def execute_trade(
     status = "error"
     order_id = None
     my_shares: float | None = None
+    actual_price: float | None = None
 
     try:
         rounded_price = round(best_price, 2)
@@ -383,7 +371,6 @@ async def execute_trade(
                 market_id=market.market_id, market_type=market.market_type,
                 strategy_name=signal.strategy_name, direction=signal.direction,
                 entry_price=best_price, bet_size_usd=bet_size,
-                confidence_multiplier=signal.confidence_multiplier,
                 token_id=token_id, condition_id=market.market_id,
                 status="error", notes=f"Price out of range: {rounded_price}",
             )
@@ -406,7 +393,6 @@ async def execute_trade(
                 market_id=market.market_id, market_type=market.market_type,
                 strategy_name=signal.strategy_name, direction=signal.direction,
                 entry_price=best_price, bet_size_usd=bet_size,
-                confidence_multiplier=signal.confidence_multiplier,
                 token_id=token_id, condition_id=market.market_id,
                 status="error", notes="Order too small",
             )
@@ -438,12 +424,34 @@ async def execute_trade(
                 })
         else:
             status = "filled"
+
+            # Extract actual filled values from order response
+            signal_shares = my_shares
+            signal_price = rounded_price
+            signal_cost = signal_shares * signal_price
+
+            actual_shares_raw = resp.get("size_matched") or resp.get("matched_size") or resp.get("filled") if isinstance(resp, dict) else None
+            actual_price_raw = resp.get("average_price") or resp.get("price") if isinstance(resp, dict) else None
+            actual_shares = int(float(actual_shares_raw)) if actual_shares_raw is not None else signal_shares
+            actual_price = float(actual_price_raw) if actual_price_raw is not None else signal_price
+            actual_cost = actual_shares * actual_price
+
+            # Overwrite for DB insert below
+            my_shares = actual_shares
+            bet_size = round(actual_cost, 2)
+
             log.info(
-                "TRADE PLACED — %s %s on %s | $%.2f (%.1fx) (%d shares) @ %.2f | order=%s",
+                "TRADE FILLED — %s %s on %s | signal: %d shares @ %.4f ($%.2f) | actual: %d shares @ %.4f ($%.2f) | order=%s",
                 signal.strategy_name, signal.direction, market_label,
-                bet_size, signal.confidence_multiplier, my_shares, rounded_price, order_id,
+                signal_shares, signal_price, signal_cost,
+                actual_shares, actual_price, actual_cost,
+                order_id,
             )
-            print(f"{Fore.GREEN}*** TRADE: {signal.strategy_name} {signal.direction} on {market_label} — ${bet_size:.2f} ({signal.confidence_multiplier:.1f}x) @ {rounded_price:.2f} ***{Style.RESET_ALL}")
+            print(
+                f"{Fore.GREEN}*** TRADE: {signal.strategy_name} {signal.direction} on {market_label}"
+                f" — actual {actual_shares} shares @ {actual_price:.4f} = ${actual_cost:.2f}"
+                f" (signal was {signal_shares} shares @ {signal_price:.4f}) ***{Style.RESET_ALL}"
+            )
 
             new_balance = await get_usdc_balance()
 
@@ -453,10 +461,12 @@ async def execute_trade(
                     "market_type": market.market_type,
                     "strategy_name": signal.strategy_name,
                     "direction": signal.direction,
-                    "entry_price": rounded_price,
-                    "bet_size_usd": bet_size,
-                    "confidence_multiplier": signal.confidence_multiplier,
-                    "shares": my_shares,
+                    "entry_price": actual_price,
+                    "bet_size_usd": actual_cost,
+                    "shares": actual_shares,
+                    "signal_entry_price": signal_price,
+                    "signal_shares": signal_shares,
+                    "signal_cost": signal_cost,
                     "token_id": token_id,
                     "order_id": order_id,
                     "balance_after": new_balance if new_balance >= 0 else None,
@@ -494,14 +504,14 @@ async def execute_trade(
                     "error": str(exc),
                 })
 
+    # For filled trades, my_shares/bet_size were overwritten with actual fill values above
     trade_id = await db.insert_bot_trade(
         market_id=market.market_id,
         market_type=market.market_type,
         strategy_name=signal.strategy_name,
         direction=signal.direction,
-        entry_price=best_price or signal.entry_price,
+        entry_price=actual_price if status == "filled" and actual_price is not None else (best_price or signal.entry_price),
         bet_size_usd=bet_size,
-        confidence_multiplier=signal.confidence_multiplier,
         shares=my_shares,
         token_id=token_id,
         condition_id=market.market_id,
@@ -511,25 +521,12 @@ async def execute_trade(
 
     # Place stop-loss GTC order after confirmed fill
     if status == "filled" and my_shares and trade_id and stop_loss_enabled:
-        # Momentum tiers carry stop-loss price in signal_data (None if not active)
-        if signal.strategy_name.startswith('momentum_') and signal.signal_data.get('stop_loss_price') is not None:
-            sl_exit = float(signal.signal_data['stop_loss_price'])
-            log.info("[STOP-LOSS] Momentum tier %s — placing stop-loss @ %.2f | token: %s | direction: %s",
-                     signal.signal_data.get('tier', '?'), sl_exit, token_id[:16], signal.direction)
+        sl_price = signal.signal_data.get('stop_loss_price')
+        if sl_price is not None:
+            sl_exit = float(sl_price)
+            log.info("[STOP-LOSS] Placing stop-loss @ %.2f | token: %s | direction: %s",
+                     sl_exit, token_id[:16], signal.direction)
             await place_stop_loss_order(
                 clob=clob, p=db.pool(), trade_id=trade_id,
                 token_id=token_id, shares=my_shares, stop_loss_price=sl_exit,
             )
-        else:
-            # Other strategies: use legacy config key pattern
-            stop_loss_key = f"{signal.strategy_name}_use_stop_loss"
-            exit_point_key = f"{signal.strategy_name}_stop_loss_exit_point"
-            use_stop_loss = live_config.get(stop_loss_key, 'false') == 'true'
-            if use_stop_loss:
-                sl_exit = float(live_config.get(exit_point_key, '0.40'))
-                log.info("[STOP-LOSS] Passing token_id to stop-loss: %s | direction: %s | this should be the %s token",
-                         token_id, signal.direction, signal.direction)
-                await place_stop_loss_order(
-                    clob=clob, p=db.pool(), trade_id=trade_id,
-                    token_id=token_id, shares=my_shares, stop_loss_price=sl_exit,
-                )

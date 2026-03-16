@@ -167,8 +167,8 @@ async def run() -> None:
     except Exception:
         log.exception("Error resolving outcomes on startup")
 
-    # Start redemption loop immediately — even with low balance we want to redeem winnings
-    asyncio.create_task(redemption_loop())
+    # Redemption disabled for now — will re-enable later
+    # asyncio.create_task(redemption_loop())
 
     if balance < config.BET_SIZE_USD:
         log.warning("Balance low: $%.2f — trading paused, redemption still running", balance)
@@ -216,35 +216,14 @@ async def run() -> None:
                 log.info("[CONFIG] Bet size: $%s | Daily loss limit: $%s",
                          live_config.get('bet_size_usd', '?'), live_config.get('daily_loss_limit', '?'))
 
-                if live_config.get('strategy_farming_enabled') == 'true':
-                    log.info("[CONFIG] Farming — trigger: %s | exit: %s | max_minutes: %s | stop_loss: %s (exit: %s)",
-                             live_config.get('farming_trigger_point'), live_config.get('farming_exit_point'),
-                             live_config.get('farming_trigger_minutes'),
-                             live_config.get('farming_use_stop_loss', 'true'),
-                             live_config.get('farming_exit_point'))
-
                 if live_config.get('strategy_momentum_enabled') == 'true':
-                    log.info("[CONFIG] Momentum — min_threshold: %s | stop_loss: %s (exit: %s)",
-                             live_config.get('momentum_min_threshold'),
-                             live_config.get('momentum_use_stop_loss', 'true'),
-                             live_config.get('momentum_exit_point', '0.50'))
-
-                if live_config.get('strategy_streak_enabled') == 'true':
-                    log.info("[CONFIG] Streak — length: %s | direction: %s",
-                             live_config.get('streak_length'), live_config.get('streak_direction'))
-
-                if live_config.get('strategy_calibration_enabled') == 'true':
-                    log.info("[CONFIG] Calibration — max_entry_seconds: %s | range: %s-%s | min_dev: %s",
-                             live_config.get('calibration_max_entry_seconds'),
-                             live_config.get('calibration_entry_low'), live_config.get('calibration_entry_high'),
-                             live_config.get('calibration_min_deviation'))
-
-                if live_config.get('strategy_late_dip_recovery_enabled') == 'true':
-                    log.info("[CONFIG] Late Dip Recovery — min_avg_price: %s | min_drop: %s | window: min 10-14 | stop_loss: %s (exit: %s)",
-                             live_config.get('late_dip_min_avg_price', '0.65'),
-                             live_config.get('late_dip_min_drop', '0.20'),
-                             live_config.get('late_dip_use_stop_loss', 'true'),
-                             live_config.get('late_dip_exit_point', '0.35'))
+                    log.info("[CONFIG] Momentum enabled — bet_pct: %s | threshold: %s | entry: %s-%ss | price: %s-%s",
+                             live_config.get('momentum_bet_pct', '0.02'),
+                             live_config.get('momentum_threshold', '0.10'),
+                             live_config.get('momentum_entry_after_seconds', '65'),
+                             live_config.get('momentum_entry_until_seconds', '90'),
+                             live_config.get('momentum_price_min', '0.50'),
+                             live_config.get('momentum_price_max', '0.75'))
 
                 first_iteration = False
 

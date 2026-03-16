@@ -123,34 +123,9 @@ async def _create_tables() -> None:
 async def seed_config_if_empty() -> None:
     """Seed bot_config with .env defaults for any keys not already in the database."""
     defaults = {
-        'STRATEGY_FARMING_ENABLED': str(config.STRATEGY_FARMING_ENABLED).lower(),
         'STRATEGY_MOMENTUM_ENABLED': str(config.STRATEGY_MOMENTUM_ENABLED).lower(),
-        'STRATEGY_STREAK_ENABLED': str(config.STRATEGY_STREAK_ENABLED).lower(),
-        'STRATEGY_CALIBRATION_ENABLED': str(config.STRATEGY_CALIBRATION_ENABLED).lower(),
-        'STRATEGY_LATE_DIP_RECOVERY_ENABLED': str(config.STRATEGY_LATE_DIP_RECOVERY_ENABLED).lower(),
         'BET_SIZE_USD': str(config.BET_SIZE_USD),
         'DAILY_LOSS_LIMIT': str(config.DAILY_LOSS_LIMIT),
-        'FARMING_TRIGGER_POINT': str(config.FARMING_TRIGGER_POINT),
-        'FARMING_EXIT_POINT': str(config.FARMING_EXIT_POINT),
-        'FARMING_TRIGGER_MINUTES': str(config.FARMING_TRIGGER_MINUTES),
-        'MOMENTUM_MIN_THRESHOLD': str(config.MOMENTUM_MIN_THRESHOLD),
-        'MOMENTUM_USE_STOP_LOSS': 'true',
-        'MOMENTUM_EXIT_POINT': '0.50',
-        'STREAK_LENGTH': str(config.STREAK_LENGTH),
-        'STREAK_DIRECTION': config.STREAK_DIRECTION,
-        'FARMING_USE_STOP_LOSS': 'true',
-        'LATE_DIP_USE_STOP_LOSS': 'true',
-        'LATE_DIP_EXIT_POINT': '0.35',
-        'momentum_multiplier_weak_threshold': '0.03',
-        'momentum_multiplier_strong_threshold': '0.07',
-        'momentum_multiplier_weak': '0.67',
-        'momentum_multiplier_base': '1.0',
-        'momentum_multiplier_strong': '1.5',
-        'momentum_multiplier_very_strong': '2.0',
-        'momentum_multiplier_price_penalty': 'true',
-        'momentum_multiplier_price_penalty_threshold': '0.70',
-        'momentum_multiplier_price_penalty_factor': '0.5',
-        'momentum_min_shares': '0',
     }
     async with pool().acquire() as conn:
         for key, value in defaults.items():
@@ -253,51 +228,6 @@ async def get_price_at_second(market_id: str, started_at: datetime, seconds: int
     return float(row["up_price"])
 
 
-async def get_recent_outcomes(market_type: str, n: int) -> list[str]:
-    """Return the last N resolved outcomes for a given market_type."""
-    async with pool().acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT final_outcome
-            FROM market_outcomes
-            WHERE market_type = $1
-              AND resolved = TRUE
-              AND final_outcome IS NOT NULL
-            ORDER BY ended_at DESC
-            LIMIT $2
-        """, market_type, n)
-    return [r["final_outcome"] for r in rows]
-
-
-async def get_calibration_deviation(market_type: str, bucket: float) -> float | None:
-    """Look up calibration deviation from the latest analysis run."""
-    async with pool().acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT deviation
-            FROM calibration_results
-            WHERE run_id = (SELECT MAX(id) FROM analysis_runs)
-              AND market_type = $1
-              AND price_bucket = $2
-              AND checkpoint_seconds = 60
-        """, market_type, Decimal(str(bucket)))
-    if row is None:
-        return None
-    return float(row["deviation"])
-
-
-async def get_average_price_between(market_id: str, started_at: datetime, from_second: int, to_second: int) -> float | None:
-    """Get average up_price between from_second and to_second after market start."""
-    async with pool().acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT AVG(up_price) as avg_price
-            FROM market_ticks
-            WHERE market_id = $1
-            AND time >= $2 + ($3 * INTERVAL '1 second')
-            AND time <= $2 + ($4 * INTERVAL '1 second')
-        """, market_id, started_at, from_second, to_second)
-        if row and row['avg_price'] is not None:
-            return float(row['avg_price'])
-        return None
-
 
 async def already_traded_this_market(market_id: str, strategy_name: str | None = None) -> bool:
     """Check if we already placed a trade on this market (optionally per-strategy)."""
@@ -331,7 +261,6 @@ async def insert_bot_trade(
     status: str,
     order_id: str | None = None,
     notes: str | None = None,
-    confidence_multiplier: float = 1.0,
 ) -> int:
     """Insert a trade record and return its id."""
     async with pool().acquire() as conn:
@@ -339,15 +268,14 @@ async def insert_bot_trade(
             INSERT INTO bot_trades
                 (market_id, market_type, strategy_name, direction,
                  entry_price, bet_size_usd, shares, token_id,
-                 condition_id, status, order_id, notes, confidence_multiplier)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                 condition_id, status, order_id, notes)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
             RETURNING id
         """,
             market_id, market_type, strategy_name, direction,
             Decimal(str(entry_price)), Decimal(str(bet_size_usd)),
             Decimal(str(shares)) if shares is not None else None,
             token_id, condition_id, status, order_id, notes,
-            Decimal(str(confidence_multiplier)),
         )
     return row["id"]
 
