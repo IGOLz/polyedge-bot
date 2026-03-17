@@ -20,81 +20,8 @@ from typing import Any
 
 import db
 from balance import get_usdc_balance
-from utils import log
-
-
-# ── M3 Strategy Configuration (HARDCODED from empirical testing) ──────────
-
-M3_CONFIG = {
-    # Core strategy parameters
-    'enabled': True,
-    'hold_to_resolution': True,  # Best performing variant
-
-    # Spike Detection
-    'spike_detection_window_seconds': 15,  # Look for spikes in first 15 seconds
-    'spike_threshold_up': 0.80,            # Spike triggers when UP >= 0.80
-    'spike_threshold_down': 0.20,          # Spike triggers when UP <= 0.20 (DOWN >= 0.80)
-
-    # Reversion Detection
-    'reversion_reversal_pct': 0.10,        # Require 10% reversion from spike
-    'min_reversion_ticks': 10,             # Reversion must happen >= 10 ticks after spike
-
-    # Entry
-    'entry_price_threshold': 0.35,         # Buy losing token when it reaches >= 0.35
-
-    # Market Filters
-    'only_5min_markets': True,
-    'allowed_assets': ['btc', 'eth', 'sol', 'xrp'],
-    'min_seconds_remaining': 30,
-
-    # Risk Management
-    'stop_loss_enabled': False,  # Not needed for hold-to-resolution
-
-    # Logging
-    'log_all_signals': True,
-    'log_rejection_reasons': True,
-}
-
-
-# ── M4 Strategy Configuration (HARDCODED from backtest) ──────────────────
-
-M4_CONFIG = {
-    # Core strategy parameters (from M4_0128)
-    'enabled': True,
-    'min_spread': 0.05,
-    'max_spread': 0.50,
-    'volatility_window_seconds': 10,
-    'volatility_threshold': 0.05,
-    'volatility_direction': 'high',
-    'eval_second': 30,
-
-    # Market filters
-    'only_5min_markets': True,
-    'allowed_assets': ['btc', 'eth', 'sol', 'xrp'],
-    'min_seconds_remaining': 60,
-
-    # Risk management
-    'stop_loss_enabled': True,
-    'stop_loss_price': 0.30,
-
-    # Logging
-    'log_all_signals': True,
-    'log_rejection_reasons': True,
-}
-
-
-# ── Shared Bet Sizing ────────────────────────────────────────────────────
-
-BET_SIZING = {
-    'starting_bankroll': 200.0,
-    'starting_bet_amount': 8.0,
-    'bet_percentage': 0.04,       # 4% of current bankroll per trade
-    'min_bet': 2.0,
-    'max_bet': 100.0,
-    'scale_with_growth': True,
-    'track_m3_separately': True,
-    'track_m4_separately': True,
-}
+from constants import M3_CONFIG, M4_CONFIG, BET_SIZING
+from utils import log, debug_log
 
 
 # ── Signal dataclass ─────────────────────────────────────────────────────
@@ -314,37 +241,42 @@ async def evaluate_m3_signal(market: db.MarketInfo, ticks: list[db.Tick]) -> Sig
 
     # GUARD 1: Strategy enabled?
     if not M3_CONFIG['enabled']:
+        debug_log.info("[M3-DEBUG] Strategy DISABLED, skipping all evaluation")
         return None
 
     # GUARD 2: 5-min market only
     if M3_CONFIG['only_5min_markets']:
         if '5m' not in market.market_type and '5min' not in market.market_type:
-            if M3_CONFIG['log_rejection_reasons']:
-                log.debug("M3: Skipping %s — not 5-min (%s)", market.market_id[:16], market.market_type)
+            debug_log.info("[M3-DEBUG] %s - Rejected: not 5-min market (type=%s)", market.market_id[:16], market.market_type)
             return None
 
     # GUARD 3: Asset filter
     market_type_lower = market.market_type.lower()
     asset_match = any(asset in market_type_lower for asset in M3_CONFIG['allowed_assets'])
     if not asset_match:
-        if M3_CONFIG['log_rejection_reasons']:
-            log.debug("M3: Skipping %s — asset not allowed (%s)", market.market_id[:16], market.market_type)
+        debug_log.info("[M3-DEBUG] %s - Rejected: asset not allowed (type=%s)", market.market_id[:16], market.market_type)
         return None
 
     # GUARD 4: Already traded this market?
     if await db.already_traded_this_market(market.market_id, 'M3_spike_reversion'):
-        log.debug("M3: Already traded %s", market.market_id[:16])
+        debug_log.info("[M3-DEBUG] %s - Rejected: already traded this market", market.market_id[:16])
         return None
 
     # GUARD 5: Still in detection window? (first 15 seconds)
     seconds_elapsed = (datetime.now(timezone.utc) - market.started_at).total_seconds()
     detection_window = M3_CONFIG['spike_detection_window_seconds']
 
+    debug_log.info("[M3-DEBUG] %s - Evaluating market type=%s | elapsed=%.1fs | window=%ds | ticks=%d",
+             market.market_id[:16], market.market_type, seconds_elapsed, detection_window, len(ticks))
+
     if seconds_elapsed > detection_window:
-        return None  # outside window, don't log (fires constantly)
+        debug_log.info("[M3-DEBUG] %s - Rejected: outside detection window (%.1fs > %ds)",
+                 market.market_id[:16], seconds_elapsed, detection_window)
+        return None
 
     # GUARD 6: Enough ticks?
     if len(ticks) < 2:
+        debug_log.info("[M3-DEBUG] %s - Rejected: not enough ticks (%d < 2)", market.market_id[:16], len(ticks))
         return None
 
     # ── STEP 1: DETECT SPIKE ──────────────────────────────────────────
@@ -360,11 +292,18 @@ async def evaluate_m3_signal(market: db.MarketInfo, ticks: list[db.Tick]) -> Sig
     min_up_price = min(t.up_price for t in ticks)
     spike_down = min_up_price <= spike_threshold_down
 
+    debug_log.info("[M3-DEBUG] %s - Spike check: max_up=%.4f (spike=%s, threshold=%.2f) | min_up=%.4f (spike=%s, threshold=%.2f)",
+             market.market_id[:16], max_up_price, spike_up, spike_threshold_up,
+             min_up_price, spike_down, spike_threshold_down)
+
     if not (spike_up or spike_down):
-        if M3_CONFIG['log_rejection_reasons']:
-            log.debug("M3: %s — no spike (max_up=%.4f, min_up=%.4f)",
-                      market.market_id[:16], max_up_price, min_up_price)
+        debug_log.info("[M3-DEBUG] %s - Rejected: NO SPIKE detected", market.market_id[:16])
         return None
+
+    debug_log.info("[M3-DEBUG] %s - SPIKE DETECTED: %s (max_up=%.4f, min_up=%.4f)",
+             market.market_id[:16],
+             "UP" if spike_up else "DOWN",
+             max_up_price, min_up_price)
 
     # ── STEP 2: DETECT REVERSION ──────────────────────────────────────
 
@@ -424,19 +363,23 @@ async def evaluate_m3_signal(market: db.MarketInfo, ticks: list[db.Tick]) -> Sig
             entry_price = ticks[reversion_tick_index].up_price
 
     if not reversion_found:
-        if M3_CONFIG['log_rejection_reasons']:
-            log.debug("M3: %s — spike %s to %.4f but no 10%% reversion yet (target: %.4f)",
-                      market.market_id[:16], spike_direction or '?',
-                      spike_price or 0, reversion_target or 0)
+        debug_log.info("[M3-DEBUG] %s - Rejected: spike %s to %.4f but NO REVERSION (target: %.4f, need %d+ ticks gap)",
+                 market.market_id[:16], spike_direction or '?',
+                 spike_price or 0, reversion_target or 0, min_reversion_ticks)
         return None
+
+    debug_log.info("[M3-DEBUG] %s - REVERSION CONFIRMED: %s reverted to %.4f at tick %d (spike at tick %d, %d ticks gap)",
+             market.market_id[:16], spike_direction, reversion_target,
+             reversion_tick_index, spike_tick_index, reversion_tick_index - spike_tick_index)
 
     # ── STEP 3: ENTRY PRICE VALIDATION ────────────────────────────────
 
     entry_threshold = M3_CONFIG['entry_price_threshold']
+    debug_log.info("[M3-DEBUG] %s - Entry validation: price=%.4f, threshold=%.2f, direction=%s",
+             market.market_id[:16], entry_price, entry_threshold, direction)
     if entry_price < entry_threshold:
-        if M3_CONFIG['log_rejection_reasons']:
-            log.debug("M3: %s — entry price too low (%.4f < %.2f)",
-                      market.market_id[:16], entry_price, entry_threshold)
+        debug_log.info("[M3-DEBUG] %s - Rejected: entry price too low (%.4f < %.2f)",
+                 market.market_id[:16], entry_price, entry_threshold)
         return None
 
     # GUARD: Minimum seconds remaining
@@ -457,10 +400,11 @@ async def evaluate_m3_signal(market: db.MarketInfo, ticks: list[db.Tick]) -> Sig
     shares = calculate_shares(entry_price, bet_size)
     actual_cost = shares * entry_price
 
-    # Don't risk more than 20% in one trade
-    if actual_cost > current_balance * 0.20:
-        log.warning("M3: %s — bet too large ($%.2f > 20%% of $%.2f)",
-                    market.market_id[:16], actual_cost, current_balance)
+    # Don't risk more than max_single_trade_pct in one trade
+    if actual_cost > current_balance * BET_SIZING['max_single_trade_pct']:
+        log.warning("M3: %s — bet too large ($%.2f > %.0f%% of $%.2f)",
+                    market.market_id[:16], actual_cost,
+                    BET_SIZING['max_single_trade_pct'] * 100, current_balance)
         return None
 
     # ── STEP 5: CREATE SIGNAL ─────────────────────────────────────────
@@ -506,13 +450,16 @@ async def evaluate_m3_signal(market: db.MarketInfo, ticks: list[db.Tick]) -> Sig
 
     # LOG the signal
     log.info(
-        "M3 SIGNAL: %s on %s | Spike: %s to %.4f at tick %d | "
-        "Reversion: %.4f at tick %d (%d ticks) | "
-        "Entry=$%.4f | Shares=%d | Cost=$%.2f | Balance=$%.2f",
-        direction, market.market_id[:16],
+        "[M3] ✅ SIGNAL GENERATED | %s | Shares: %d, Cost: $%.2f | Balance: $%.2f",
+        direction, shares, actual_cost, current_balance,
+    )
+    log.info(
+        "[M3-DEBUG] %s - Full signal: Spike=%s to %.4f at tick %d | "
+        "Reversion=%.4f at tick %d (%d ticks) | Entry=$%.4f | BetSize=$%.2f",
+        market.market_id[:16],
         spike_direction, spike_price, spike_tick_index,
         reversion_target, reversion_tick_index, reversion_seconds,
-        entry_price, shares, actual_cost, current_balance,
+        entry_price, bet_size,
     )
     log.info("M3 THESIS: %s", thesis)
 
@@ -560,7 +507,8 @@ async def evaluate_m4_signal(market: db.MarketInfo, ticks: list[db.Tick]) -> Sig
     seconds_elapsed = (datetime.now(timezone.utc) - market.started_at).total_seconds()
     eval_second = M4_CONFIG['eval_second']
 
-    if not (eval_second - 2 <= seconds_elapsed <= eval_second + 2):
+    eval_window = M4_CONFIG['eval_window']
+    if not (eval_second - eval_window <= seconds_elapsed <= eval_second + eval_window):
         return None  # fires constantly, don't log
 
     # GUARD 6: Enough tick data for volatility window
@@ -604,15 +552,20 @@ async def evaluate_m4_signal(market: db.MarketInfo, ticks: list[db.Tick]) -> Sig
             log.debug("M4: %s — low volatility (%.6f < %.2f)", market.market_id[:16], volatility, vol_threshold)
         return None
 
-    # DETERMINE: Bet direction (contrarian to current price pressure)
-    # If UP price > 0.50, market favors UP -> bet DOWN (buy cheap DOWN tokens)
-    # If UP price < 0.50, market favors DOWN -> bet UP (buy cheap UP tokens)
+    # DETERMINE: Bet direction (momentum — follow the dominant direction)
+    # If UP price > 0.50, market momentum favors UP -> bet UP
+    # If UP price < 0.50, market momentum favors DOWN -> bet DOWN
     if up_price > 0.50:
-        direction = 'Down'
-        entry_price = down_price  # buying the cheaper side
-    else:
         direction = 'Up'
-        entry_price = up_price   # buying the cheaper side
+        entry_price = up_price
+    else:
+        direction = 'Down'
+        entry_price = down_price
+
+    debug_log.info(
+        "[M4-DEBUG] Direction decided: up=%.4f, down=%.4f → %s (momentum) | entry=$%.4f",
+        up_price, down_price, direction, entry_price,
+    )
 
     # GUARD: Minimum seconds remaining
     market_total_seconds = 300  # 5-min market
@@ -632,9 +585,11 @@ async def evaluate_m4_signal(market: db.MarketInfo, ticks: list[db.Tick]) -> Sig
     shares = calculate_shares(entry_price, bet_size)
     actual_cost = shares * entry_price
 
-    # GUARD: Don't risk more than 20% of balance in one trade
-    if actual_cost > current_balance * 0.20:
-        log.warning("M4: %s — bet too large ($%.2f > 20%% of $%.2f)", market.market_id[:16], actual_cost, current_balance)
+    # GUARD: Don't risk more than max_single_trade_pct of balance in one trade
+    if actual_cost > current_balance * BET_SIZING['max_single_trade_pct']:
+        log.warning("M4: %s — bet too large ($%.2f > %.0f%% of $%.2f)",
+                    market.market_id[:16], actual_cost,
+                    BET_SIZING['max_single_trade_pct'] * 100, current_balance)
         return None
 
     # Stop-loss
@@ -642,10 +597,9 @@ async def evaluate_m4_signal(market: db.MarketInfo, ticks: list[db.Tick]) -> Sig
     sl_price = M4_CONFIG['stop_loss_price'] if sl_active else None
 
     # Profitability thesis
-    opposite = 'Down' if direction == 'Up' else 'Up'
     thesis = (
         f"Volatility spike (sigma={volatility:.4f}) at second {seconds_elapsed:.0f}. "
-        f"Betting {direction} contrarian against {opposite} price extreme "
+        f"Betting {direction} momentum — following dominant direction "
         f"(up={up_price:.4f}, down={down_price:.4f}, spread={spread:.4f})."
     )
 
@@ -725,7 +679,8 @@ async def evaluate_strategies(market: db.MarketInfo, ticks: list[db.Tick]) -> li
     # ── M4: Precise timing (second 30 +- 2s) ─────────────────────────
     if M4_CONFIG['enabled']:
         eval_second = M4_CONFIG['eval_second']
-        if eval_second - 2 <= seconds_elapsed <= eval_second + 2:
+        eval_window = M4_CONFIG['eval_window']
+        if eval_second - eval_window <= seconds_elapsed <= eval_second + eval_window:
             m4_signal = await evaluate_m4_signal(market, ticks)
             if m4_signal:
                 log.info("[M4] Signal generated for %s", market.market_id[:16])

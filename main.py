@@ -16,7 +16,7 @@ from balance import get_usdc_balance
 from executor import execute_trade, get_execution_metrics, get_variance_metrics
 from redeemer import redemption_loop
 from strategies import evaluate_strategies
-from utils import log
+from utils import log, debug_log
 
 
 
@@ -281,24 +281,60 @@ async def run() -> None:
         try:
             live_config = await db.get_live_config()
 
-            # Log active strategies on first iteration
+            # Log ALL strategy parameters on first iteration
             if first_iteration:
-                from strategies import M3_CONFIG, M4_CONFIG, BET_SIZING
+                from constants import M3_CONFIG, M4_CONFIG, BET_SIZING
+
                 active = []
                 if M3_CONFIG['enabled']:
                     active.append('M3_spike_reversion')
                 if M4_CONFIG['enabled']:
                     active.append('M4_volatility')
                 log.info("[CONFIG] Active strategies: %s", ', '.join(active) or 'none')
-                log.info("[CONFIG] M3 params — spike_threshold: %.2f | reversion: %.0f%% | window: %ds | min_reversion_ticks: %d",
-                         M3_CONFIG['spike_threshold_up'], M3_CONFIG['reversion_reversal_pct'] * 100,
-                         M3_CONFIG['spike_detection_window_seconds'], M3_CONFIG['min_reversion_ticks'])
-                log.info("[CONFIG] M4 params — eval_second: %d | vol_threshold: %.2f | spread: [%.2f, %.2f]",
-                         M4_CONFIG['eval_second'], M4_CONFIG['volatility_threshold'],
+
+                # ── M3 : every parameter ──
+                log.info("[CONFIG] M3 enabled=%s | hold_to_resolution=%s",
+                         M3_CONFIG['enabled'], M3_CONFIG['hold_to_resolution'])
+                log.info("[CONFIG] M3 spike_detection_window=%ds | spike_threshold_up=%.2f | spike_threshold_down=%.2f",
+                         M3_CONFIG['spike_detection_window_seconds'],
+                         M3_CONFIG['spike_threshold_up'], M3_CONFIG['spike_threshold_down'])
+                log.info("[CONFIG] M3 reversion_reversal_pct=%.0f%% | min_reversion_ticks=%d",
+                         M3_CONFIG['reversion_reversal_pct'] * 100, M3_CONFIG['min_reversion_ticks'])
+                log.info("[CONFIG] M3 entry_price_threshold=%.2f | min_seconds_remaining=%d",
+                         M3_CONFIG['entry_price_threshold'], M3_CONFIG['min_seconds_remaining'])
+                log.info("[CONFIG] M3 only_5min_markets=%s | allowed_assets=%s",
+                         M3_CONFIG['only_5min_markets'], M3_CONFIG['allowed_assets'])
+                log.info("[CONFIG] M3 stop_loss_enabled=%s", M3_CONFIG['stop_loss_enabled'])
+
+                # ── M4 : every parameter ──
+                log.info("[CONFIG] M4 enabled=%s | eval_second=%d | eval_window=%ds",
+                         M4_CONFIG['enabled'], M4_CONFIG['eval_second'], M4_CONFIG['eval_window'])
+                log.info("[CONFIG] M4 volatility_window=%ds | volatility_threshold=%.2f | volatility_direction=%s",
+                         M4_CONFIG['volatility_window_seconds'],
+                         M4_CONFIG['volatility_threshold'], M4_CONFIG['volatility_direction'])
+                log.info("[CONFIG] M4 min_spread=%.2f | max_spread=%.2f",
                          M4_CONFIG['min_spread'], M4_CONFIG['max_spread'])
-                log.info("[CONFIG] Bet sizing: %.0f%% of bankroll | Daily loss limit: $%s",
-                         BET_SIZING['bet_percentage'] * 100,
-                         live_config.get('daily_loss_limit', '?'))
+                log.info("[CONFIG] M4 only_5min_markets=%s | allowed_assets=%s",
+                         M4_CONFIG['only_5min_markets'], M4_CONFIG['allowed_assets'])
+                log.info("[CONFIG] M4 min_seconds_remaining=%d | stop_loss_enabled=%s | stop_loss_price=%.2f",
+                         M4_CONFIG['min_seconds_remaining'],
+                         M4_CONFIG['stop_loss_enabled'], M4_CONFIG['stop_loss_price'])
+
+                # ── Bet sizing : every parameter ──
+                log.info("[CONFIG] BET starting_bankroll=$%.2f | starting_bet=$%.2f | bet_pct=%.0f%%",
+                         BET_SIZING['starting_bankroll'], BET_SIZING['starting_bet_amount'],
+                         BET_SIZING['bet_percentage'] * 100)
+                log.info("[CONFIG] BET min=$%.2f | max=$%.2f | max_single_trade_pct=%.0f%%",
+                         BET_SIZING['min_bet'], BET_SIZING['max_bet'],
+                         BET_SIZING['max_single_trade_pct'] * 100)
+                log.info("[CONFIG] BET scale_with_growth=%s | track_m3_separately=%s | track_m4_separately=%s",
+                         BET_SIZING['scale_with_growth'],
+                         BET_SIZING['track_m3_separately'], BET_SIZING['track_m4_separately'])
+
+                # ── Runtime config ──
+                log.info("[CONFIG] LOOP_INTERVAL=%ds | Daily loss limit=$%s",
+                         config.LOOP_INTERVAL, live_config.get('daily_loss_limit', '?'))
+
                 first_iteration = False
 
             # Log any config changes
@@ -312,6 +348,50 @@ async def run() -> None:
 
             active_markets = await db.get_active_markets()
 
+            # ── Market availability diagnostics ──────────────────────────
+            if active_markets:
+                from constants import M3_CONFIG as _m3, M4_CONFIG as _m4
+                now = datetime.now(timezone.utc)
+                asset_counts: dict[str, int] = {}
+                m3_window_count = 0
+                m4_window_count = 0
+                already_traded_m4 = 0
+                already_traded_m3 = 0
+                m3_win = _m3['spike_detection_window_seconds']
+                m4_sec = _m4['eval_second']
+                m4_win = _m4['eval_window']
+
+                for m in active_markets:
+                    elapsed = (now - m.started_at).total_seconds()
+                    mt_lower = m.market_type.lower()
+
+                    # Count by asset
+                    for asset in ('btc', 'eth', 'sol', 'xrp'):
+                        if asset in mt_lower:
+                            asset_counts[asset.upper()] = asset_counts.get(asset.upper(), 0) + 1
+                            break
+
+                    # Count markets in M3 window
+                    if elapsed <= m3_win:
+                        m3_window_count += 1
+                        if await db.already_traded_this_market(m.market_id, 'M3_spike_reversion'):
+                            already_traded_m3 += 1
+
+                    # Count markets in M4 window
+                    if m4_sec - m4_win <= elapsed <= m4_sec + m4_win:
+                        m4_window_count += 1
+                        if await db.already_traded_this_market(m.market_id, 'M4_volatility'):
+                            already_traded_m4 += 1
+
+                assets_str = ' | '.join(f"{k}: {v}" for k, v in sorted(asset_counts.items()))
+                debug_log.info(
+                    "[MARKET-COUNT] Active: %d | M3-window(<%ds): %d (traded: %d) | "
+                    "M4-window(%d-%ds): %d (traded: %d) | %s",
+                    len(active_markets),
+                    m3_win, m3_window_count, already_traded_m3,
+                    m4_sec - m4_win, m4_sec + m4_win, m4_window_count, already_traded_m4,
+                    assets_str,
+                )
 
             for market in active_markets:
                 ticks = await db.get_market_ticks(market.market_id, market.started_at)

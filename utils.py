@@ -104,4 +104,21 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
+def setup_debug_logging() -> logging.Logger:
+    """Separate logger for signal debug lines → debug_signals.log only."""
+    logger = logging.getLogger("polyedge.debug")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False  # Don't bubble up to main logger
+
+    if not os.path.exists("/.dockerenv"):
+        plain_fmt = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s")
+        fh = logging.FileHandler("debug_signals.log", encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(plain_fmt)
+        logger.addHandler(fh)
+
+    return logger
+
+
 log = setup_logging()
+debug_log = setup_debug_logging()

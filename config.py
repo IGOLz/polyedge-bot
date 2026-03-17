@@ -43,7 +43,7 @@ STRATEGY_MOMENTUM_ENABLED: bool = os.getenv("STRATEGY_MOMENTUM_ENABLED", "true")
 # ── Betting ──────────────────────────────────────────────────────────────
 BET_SIZE_USD: float = float(os.getenv("BET_SIZE_USD", "1.5"))
 DAILY_LOSS_LIMIT: float = float(os.getenv("DAILY_LOSS_LIMIT", "30.0"))
-LOOP_INTERVAL: int = int(os.getenv("LOOP_INTERVAL", "5"))
+LOOP_INTERVAL: int = int(os.getenv("LOOP_INTERVAL", "1"))
 
 # ── Dry-run mode (set via --dry-run CLI flag) ────────────────────────────
 DRY_RUN: bool = False

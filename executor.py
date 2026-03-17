@@ -13,6 +13,7 @@ from py_clob_client.clob_types import OrderArgs, OrderType
 import config
 import db
 from balance import get_usdc_balance
+from constants import EXECUTION_CONFIG
 from strategies import Signal
 from utils import log
 
@@ -36,8 +37,8 @@ class ExecutionStage:
 
 _STAGE_LABELS = {
     ExecutionStage.IDEAL_LIMIT: "Stage 1 (Ideal Limit)",
-    ExecutionStage.RELAXED_LIMIT: "Stage 2 (Relaxed +1¢)",
-    ExecutionStage.MARKET_FOK: "Stage 3 (Market FOK)",
+    ExecutionStage.RELAXED_LIMIT: f"Stage 2 (Relaxed +{EXECUTION_CONFIG['stage_2_offset']*100:.0f}¢)",
+    ExecutionStage.MARKET_FOK: f"Stage 3 (FOK +{EXECUTION_CONFIG['stage_3_offset']*100:.0f}¢)",
 }
 
 
@@ -406,9 +407,9 @@ async def _execute_hybrid(
 
     # (stage_name, price_offset, poll_timeout, order_type)
     stages = [
-        (ExecutionStage.IDEAL_LIMIT,   0.00, 1.0, OrderType.GTC),
-        (ExecutionStage.RELAXED_LIMIT, 0.01, 1.0, OrderType.GTC),
-        (ExecutionStage.MARKET_FOK,    0.02, None, OrderType.FOK),
+        (ExecutionStage.IDEAL_LIMIT,   EXECUTION_CONFIG['stage_1_offset'], EXECUTION_CONFIG['stage_1_timeout'], OrderType.GTC),
+        (ExecutionStage.RELAXED_LIMIT, EXECUTION_CONFIG['stage_2_offset'], EXECUTION_CONFIG['stage_2_timeout'], OrderType.GTC),
+        (ExecutionStage.MARKET_FOK,    EXECUTION_CONFIG['stage_3_offset'], None,                                OrderType.FOK),
     ]
 
     for stage_name, offset, poll_timeout, order_type in stages:
@@ -425,53 +426,55 @@ async def _execute_hybrid(
             f"{poll_timeout}s" if poll_timeout else "immediate",
         )
 
-        try:
-            def _place(p=price, s=shares, ot=order_type):
-                order_args = OrderArgs(token_id=token_id, price=p, size=s, side="BUY")
-                signed = clob.create_order(order_args)
-                return clob.post_order(signed, ot)
+        # FOK retry loop: keep retrying if price hasn't moved, up to max time
+        fok_deadline = time.time() + EXECUTION_CONFIG['fok_retry_max_seconds'] if order_type == OrderType.FOK else 0
+        fok_attempt = 0
 
-            resp = await asyncio.wait_for(
-                loop.run_in_executor(None, _place),
-                timeout=5.0,
-            )
+        while True:
+            fok_attempt += 1
 
-            order_id = (resp.get("orderID") or resp.get("order_id")) if isinstance(resp, dict) else None
-            order_status = (resp.get("status") or "").upper() if isinstance(resp, dict) else ""
+            try:
+                def _place(p=price, s=shares, ot=order_type):
+                    order_args = OrderArgs(token_id=token_id, price=p, size=s, side="BUY")
+                    signed = clob.create_order(order_args)
+                    return clob.post_order(signed, ot)
 
-            if order_type == OrderType.FOK:
-                # FOK: check immediate fill from response
-                if order_status in ("CANCELLED", "EXPIRED", ""):
-                    log.info("[EXEC] %s — no fill (FOK)", label)
-                    continue
-
-                fill_shares, fill_price = _parse_fill_from_resp(resp, shares, price)
-                elapsed = time.time() - start_time
-                slippage = (fill_price - ideal_price) * fill_shares
-
-                _exec_metrics.record(stage_name, True, slippage, elapsed)
-                log.info(
-                    "[EXEC] ✅ %s filled | %d shares @ $%.4f | slippage: $%.3f | time: %.2fs",
-                    label, fill_shares, fill_price, slippage, elapsed,
+                resp = await asyncio.wait_for(
+                    loop.run_in_executor(None, _place),
+                    timeout=5.0,
                 )
-                result.update({
-                    "filled": True, "order_id": order_id,
-                    "fill_price": fill_price, "fill_shares": fill_shares,
-                    "stage": stage_name, "slippage": slippage, "elapsed": elapsed,
-                })
-                return result
 
-            else:
-                # GTC: check if immediately matched, otherwise poll
-                if order_status in ("MATCHED", "FILLED"):
+                order_id = (resp.get("orderID") or resp.get("order_id")) if isinstance(resp, dict) else None
+                order_status = (resp.get("status") or "").upper() if isinstance(resp, dict) else ""
+
+                if order_type == OrderType.FOK:
+                    # FOK: check immediate fill from response
+                    if order_status in ("CANCELLED", "EXPIRED", ""):
+                        # Check if we should retry
+                        if time.time() < fok_deadline:
+                            # Check if price has moved — if so, stop retrying
+                            current_best = _get_best_price(clob, token_id, "BUY")
+                            if current_best is not None and current_best > price:
+                                log.info("[EXEC] %s — FOK no fill, price moved ($%.4f > $%.2f), stopping retries",
+                                         label, current_best, price)
+                                break  # price moved, exit retry loop
+                            log.info("[EXEC] %s — FOK no fill (attempt %d), price stable, retrying...",
+                                     label, fok_attempt)
+                            await asyncio.sleep(EXECUTION_CONFIG['fok_retry_interval'])
+                            continue  # retry FOK
+                        else:
+                            log.info("[EXEC] %s — FOK no fill after %d attempts (%.0fs), giving up",
+                                     label, fok_attempt, EXECUTION_CONFIG['fok_retry_max_seconds'])
+                            break  # deadline reached, exit retry loop
+
                     fill_shares, fill_price = _parse_fill_from_resp(resp, shares, price)
                     elapsed = time.time() - start_time
                     slippage = (fill_price - ideal_price) * fill_shares
 
                     _exec_metrics.record(stage_name, True, slippage, elapsed)
                     log.info(
-                        "[EXEC] ✅ %s filled (immediate) | %d shares @ $%.4f | slippage: $%.3f | time: %.2fs",
-                        label, fill_shares, fill_price, slippage, elapsed,
+                        "[EXEC] ✅ %s filled (attempt %d) | %d shares @ $%.4f | slippage: $%.3f | time: %.2fs",
+                        label, fok_attempt, fill_shares, fill_price, slippage, elapsed,
                     )
                     result.update({
                         "filled": True, "order_id": order_id,
@@ -480,62 +483,86 @@ async def _execute_hybrid(
                     })
                     return result
 
-                if not order_id:
-                    log.warning("[EXEC] %s — no order ID returned, skipping stage", label)
-                    continue
+                else:
+                    # GTC: check if immediately matched, otherwise poll
+                    if order_status in ("MATCHED", "FILLED"):
+                        fill_shares, fill_price = _parse_fill_from_resp(resp, shares, price)
+                        elapsed = time.time() - start_time
+                        slippage = (fill_price - ideal_price) * fill_shares
 
-                # Poll for fill
-                filled, order_detail = await _wait_for_fill(clob, order_id, poll_timeout)
-                if filled:
-                    fill_shares, fill_price = _parse_fill_from_resp(order_detail, shares, price)
-                    elapsed = time.time() - start_time
-                    slippage = (fill_price - ideal_price) * fill_shares
+                        _exec_metrics.record(stage_name, True, slippage, elapsed)
+                        log.info(
+                            "[EXEC] ✅ %s filled (immediate) | %d shares @ $%.4f | slippage: $%.3f | time: %.2fs",
+                            label, fill_shares, fill_price, slippage, elapsed,
+                        )
+                        result.update({
+                            "filled": True, "order_id": order_id,
+                            "fill_price": fill_price, "fill_shares": fill_shares,
+                            "stage": stage_name, "slippage": slippage, "elapsed": elapsed,
+                        })
+                        return result
 
-                    _exec_metrics.record(stage_name, True, slippage, elapsed)
-                    log.info(
-                        "[EXEC] ✅ %s filled | %d shares @ $%.4f | slippage: $%.3f | time: %.2fs",
-                        label, fill_shares, fill_price, slippage, elapsed,
-                    )
-                    result.update({
-                        "filled": True, "order_id": order_id,
-                        "fill_price": fill_price, "fill_shares": fill_shares,
-                        "stage": stage_name, "slippage": slippage, "elapsed": elapsed,
-                    })
-                    return result
+                    if not order_id:
+                        log.warning("[EXEC] %s — no order ID returned, skipping stage", label)
+                        break  # exit retry loop, move to next stage
 
-                # Not filled — cancel and move to next stage
-                log.info("[EXEC] ⏱️ %s timeout after %.1fs — cancelling", label, poll_timeout)
-                await _cancel_open_order(clob, order_id)
+                    # Poll for fill
+                    filled, order_detail = await _wait_for_fill(clob, order_id, poll_timeout)
+                    if filled:
+                        fill_shares, fill_price = _parse_fill_from_resp(order_detail, shares, price)
+                        elapsed = time.time() - start_time
+                        slippage = (fill_price - ideal_price) * fill_shares
 
-        except asyncio.TimeoutError:
-            log.warning("[EXEC] %s — API timeout, continuing to next stage", label)
-            continue
+                        _exec_metrics.record(stage_name, True, slippage, elapsed)
+                        log.info(
+                            "[EXEC] ✅ %s filled | %d shares @ $%.4f | slippage: $%.3f | time: %.2fs",
+                            label, fill_shares, fill_price, slippage, elapsed,
+                        )
+                        result.update({
+                            "filled": True, "order_id": order_id,
+                            "fill_price": fill_price, "fill_shares": fill_shares,
+                            "stage": stage_name, "slippage": slippage, "elapsed": elapsed,
+                        })
+                        return result
 
-        except Exception as exc:
-            exc_msg = str(exc).lower()
-            # Fatal errors — stop all stages
-            if "min size" in exc_msg or "invalid amount" in exc_msg:
-                result["error_status"] = "error"
-                result["error_notes"] = str(exc)[:500]
-                log.warning("[EXEC] %s — order too small: %s", label, exc)
-                break
-            elif "insufficient" in exc_msg or "balance" in exc_msg:
-                result["error_status"] = "error"
-                result["error_notes"] = str(exc)[:500]
-                log.error("[EXEC] %s — insufficient funds: %s", label, exc)
-                break
-            elif "closed" in exc_msg or "resolved" in exc_msg:
-                result["error_status"] = "error"
-                result["error_notes"] = str(exc)[:500]
-                log.warning("[EXEC] %s — market closed/resolved", label)
-                break
-            # Non-fatal — continue to next stage
-            elif "couldn't be fully filled" in exc_msg or "fully filled or killed" in exc_msg:
-                log.info("[EXEC] %s — no fill (FOK exception)", label)
-                continue
-            else:
-                log.warning("[EXEC] %s — error: %s, continuing", label, exc)
-                continue
+                    # Not filled — cancel and move to next stage
+                    log.info("[EXEC] ⏱️ %s timeout after %.1fs — cancelling", label, poll_timeout)
+                    await _cancel_open_order(clob, order_id)
+                    break  # exit retry loop, move to next stage
+
+            except asyncio.TimeoutError:
+                log.warning("[EXEC] %s — API timeout, continuing to next stage", label)
+                break  # exit retry loop
+
+            except Exception as exc:
+                exc_msg = str(exc).lower()
+                # Fatal errors — stop all stages
+                if "min size" in exc_msg or "invalid amount" in exc_msg:
+                    result["error_status"] = "error"
+                    result["error_notes"] = str(exc)[:500]
+                    log.warning("[EXEC] %s — order too small: %s", label, exc)
+                    return result  # fatal, exit entirely
+                elif "insufficient" in exc_msg or "balance" in exc_msg:
+                    result["error_status"] = "error"
+                    result["error_notes"] = str(exc)[:500]
+                    log.error("[EXEC] %s — insufficient funds: %s", label, exc)
+                    return result  # fatal, exit entirely
+                elif "closed" in exc_msg or "resolved" in exc_msg:
+                    result["error_status"] = "error"
+                    result["error_notes"] = str(exc)[:500]
+                    log.warning("[EXEC] %s — market closed/resolved", label)
+                    return result  # fatal, exit entirely
+                # Non-fatal — for FOK, retry if within deadline; for GTC, move to next stage
+                elif "couldn't be fully filled" in exc_msg or "fully filled or killed" in exc_msg:
+                    if order_type == OrderType.FOK and time.time() < fok_deadline:
+                        log.info("[EXEC] %s — FOK exception (attempt %d), retrying...", label, fok_attempt)
+                        await asyncio.sleep(EXECUTION_CONFIG['fok_retry_interval'])
+                        continue  # retry
+                    log.info("[EXEC] %s — no fill (FOK exception)", label)
+                    break  # exit retry loop
+                else:
+                    log.warning("[EXEC] %s — error: %s, continuing", label, exc)
+                    break  # exit retry loop
 
     # All stages exhausted or fatal error
     elapsed = time.time() - start_time
