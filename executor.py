@@ -248,6 +248,7 @@ async def execute_trade(
             strategy_name=signal.strategy_name, direction=signal.direction,
             entry_price=signal.entry_price, bet_size_usd=bet_size,
             status="dry_run", condition_id=market.market_id,
+            signal_data=signal.signal_data,
         )
         await db.log_event("trade_dry_run",
             f"[DRY RUN] Would place {signal.direction} on {market.market_type} — strategy: {signal.strategy_name}", {
@@ -269,6 +270,7 @@ async def execute_trade(
             strategy_name=signal.strategy_name, direction=signal.direction,
             entry_price=signal.entry_price, bet_size_usd=bet_size,
             status="skipped_daily_limit", condition_id=market.market_id,
+            signal_data=signal.signal_data,
         )
         await db.log_event("trade_skipped",
             f"Daily loss limit reached — net loss today: ${_daily_net_loss:.2f} / ${daily_limit:.2f}", {
@@ -294,6 +296,7 @@ async def execute_trade(
                 strategy_name=signal.strategy_name, direction=signal.direction,
                 entry_price=signal.entry_price, bet_size_usd=bet_size,
                 status="skipped_bankroll", condition_id=market.market_id,
+                signal_data=signal.signal_data,
             )
             await db.log_event("trade_skipped",
                 f"Signal skipped — bankroll (${balance:.2f} < ${min_runway:.2f})", {
@@ -324,6 +327,7 @@ async def execute_trade(
                 entry_price=signal.entry_price, bet_size_usd=bet_size,
                 status="error", condition_id=market.market_id,
                 notes="Failed to resolve token IDs",
+                signal_data=signal.signal_data,
             )
             await db.log_event("bot_error",
                 f"Failed to resolve token IDs for {market_label}", {
@@ -346,6 +350,7 @@ async def execute_trade(
             entry_price=signal.entry_price, bet_size_usd=bet_size,
             token_id=token_id, condition_id=market.market_id,
             status="error", notes="No liquidity",
+            signal_data=signal.signal_data,
         )
         await db.log_event("trade_skipped",
             f"Signal skipped — no liquidity for {signal.direction} on {market_label}", {
@@ -364,56 +369,156 @@ async def execute_trade(
     actual_price: float | None = None
     error_notes: str | None = None
 
-    try:
-        rounded_price = round(best_price, 2)
-        if rounded_price <= 0 or rounded_price >= 1:
-            log.warning("Rounded price %.2f out of range — skipping %s", rounded_price, market_label)
-            await db.insert_bot_trade(
-                market_id=market.market_id, market_type=market.market_type,
-                strategy_name=signal.strategy_name, direction=signal.direction,
-                entry_price=best_price, bet_size_usd=bet_size,
-                token_id=token_id, condition_id=market.market_id,
-                status="error", notes=f"Price out of range: {rounded_price}",
-            )
-            return
-
-        my_shares = math.floor(bet_size / rounded_price)
-        min_shares = math.ceil(MIN_DOLLAR_SIZE / rounded_price)
-        if my_shares < min_shares:
-            my_shares = min_shares
-
-        # Apply momentum_min_shares if configured
-        cfg_min_shares = int(live_config.get('momentum_min_shares', '0'))
-        if cfg_min_shares > 0 and my_shares < cfg_min_shares:
-            log.info("[BET-SIZE] Shares (%d) below min_shares (%d) — increasing to %d", my_shares, cfg_min_shares, cfg_min_shares)
-            my_shares = cfg_min_shares
-
-        if my_shares < 1:
-            log.warning("Cannot meet $1 minimum at price %.2f — skipping", rounded_price)
-            await db.insert_bot_trade(
-                market_id=market.market_id, market_type=market.market_type,
-                strategy_name=signal.strategy_name, direction=signal.direction,
-                entry_price=best_price, bet_size_usd=bet_size,
-                token_id=token_id, condition_id=market.market_id,
-                status="error", notes="Order too small",
-            )
-            return
-
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=rounded_price,
-            size=my_shares,
-            side="BUY",
+    rounded_price = round(best_price, 2)
+    if rounded_price <= 0 or rounded_price >= 1:
+        log.warning("Rounded price %.2f out of range — skipping %s", rounded_price, market_label)
+        await db.insert_bot_trade(
+            market_id=market.market_id, market_type=market.market_type,
+            strategy_name=signal.strategy_name, direction=signal.direction,
+            entry_price=best_price, bet_size_usd=bet_size,
+            token_id=token_id, condition_id=market.market_id,
+            status="error", notes=f"Price out of range: {rounded_price}",
+            signal_data=signal.signal_data,
         )
-        signed = clob.create_order(order_args)
-        resp = clob.post_order(signed, OrderType.FOK)
+        return
 
-        order_id = resp.get("orderID") or resp.get("order_id") if isinstance(resp, dict) else None
-        order_status = (resp.get("status") or "").upper() if isinstance(resp, dict) else ""
+    my_shares = math.floor(bet_size / rounded_price)
+    min_shares = math.ceil(MIN_DOLLAR_SIZE / rounded_price)
+    if my_shares < min_shares:
+        my_shares = min_shares
 
-        if order_status in ("CANCELLED", "EXPIRED", ""):
+    # Apply momentum_min_shares if configured
+    cfg_min_shares = int(live_config.get('momentum_min_shares', '0'))
+    if cfg_min_shares > 0 and my_shares < cfg_min_shares:
+        log.info("[BET-SIZE] Shares (%d) below min_shares (%d) — increasing to %d", my_shares, cfg_min_shares, cfg_min_shares)
+        my_shares = cfg_min_shares
+
+    if my_shares < 1:
+        log.warning("Cannot meet $1 minimum at price %.2f — skipping", rounded_price)
+        await db.insert_bot_trade(
+            market_id=market.market_id, market_type=market.market_type,
+            strategy_name=signal.strategy_name, direction=signal.direction,
+            entry_price=best_price, bet_size_usd=bet_size,
+            token_id=token_id, condition_id=market.market_id,
+            status="error", notes="Order too small",
+            signal_data=signal.signal_data,
+        )
+        return
+
+    fok_retry_delays = [1, 2, 3]  # seconds between retries
+    max_attempts = 1 + len(fok_retry_delays)
+
+    for attempt in range(max_attempts):
+        fok_no_fill = False
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=rounded_price,
+                size=my_shares,
+                side="BUY",
+            )
+            signed = clob.create_order(order_args)
+            resp = clob.post_order(signed, OrderType.FOK)
+
+            order_id = resp.get("orderID") or resp.get("order_id") if isinstance(resp, dict) else None
+            order_status = (resp.get("status") or "").upper() if isinstance(resp, dict) else ""
+
+            if order_status in ("CANCELLED", "EXPIRED", ""):
+                fok_no_fill = True
+            else:
+                status = "filled"
+
+                # Extract actual filled values from order response
+                signal_shares = my_shares
+                signal_price = rounded_price
+                signal_cost = signal_shares * signal_price
+
+                actual_shares_raw = resp.get("size_matched") or resp.get("matched_size") or resp.get("filled") if isinstance(resp, dict) else None
+                actual_price_raw = resp.get("average_price") or resp.get("price") if isinstance(resp, dict) else None
+                actual_shares = int(float(actual_shares_raw)) if actual_shares_raw is not None else signal_shares
+                actual_price = float(actual_price_raw) if actual_price_raw is not None else signal_price
+                actual_cost = actual_shares * actual_price
+
+                # Overwrite for DB insert below
+                my_shares = actual_shares
+                bet_size = round(actual_cost, 2)
+
+                log.info(
+                    "TRADE FILLED — %s %s on %s | signal: %d shares @ %.4f ($%.2f) | actual: %d shares @ %.4f ($%.2f) | order=%s",
+                    signal.strategy_name, signal.direction, market_label,
+                    signal_shares, signal_price, signal_cost,
+                    actual_shares, actual_price, actual_cost,
+                    order_id,
+                )
+                print(
+                    f"{Fore.GREEN}*** TRADE: {signal.strategy_name} {signal.direction} on {market_label}"
+                    f" — actual {actual_shares} shares @ {actual_price:.4f} = ${actual_cost:.2f}"
+                    f" (signal was {signal_shares} shares @ {signal_price:.4f}) ***{Style.RESET_ALL}"
+                )
+
+                new_balance = await get_usdc_balance()
+
+                await db.log_event("trade_placed",
+                    f"Placed {signal.direction} on {market.market_type} — strategy: {signal.strategy_name}", {
+                        "market_id": market.market_id,
+                        "market_type": market.market_type,
+                        "strategy_name": signal.strategy_name,
+                        "direction": signal.direction,
+                        "entry_price": actual_price,
+                        "bet_size_usd": actual_cost,
+                        "shares": actual_shares,
+                        "signal_entry_price": signal_price,
+                        "signal_shares": signal_shares,
+                        "signal_cost": signal_cost,
+                        "token_id": token_id,
+                        "order_id": order_id,
+                        "balance_after": new_balance if new_balance >= 0 else None,
+                        "signal_data": signal.signal_data,
+                    })
+                break  # filled — exit retry loop
+
+        except Exception as exc:
+            exc_msg = str(exc).lower()
+            error_notes = str(exc)[:500]
+            if "couldn't be fully filled" in exc_msg or "fully filled or killed" in exc_msg:
+                fok_no_fill = True
+                error_notes = None
+            elif "min size" in exc_msg or "invalid amount" in exc_msg:
+                status = "error"
+                log.warning("Order too small for %s — %s", market_label, exc)
+                break
+            elif "insufficient" in exc_msg or "balance" in exc_msg:
+                status = "error"
+                log.error("Insufficient funds for %s — %s", market_label, exc)
+                break
+            elif "closed" in exc_msg or "resolved" in exc_msg:
+                status = "error"
+                log.warning("Market closed/resolved for %s — skipping", market_label)
+                break
+            else:
+                status = "error"
+                log.exception("Order failed — %s", exc)
+                await db.log_event("bot_error",
+                    f"Order failed for {market_label} — {exc}", {
+                        "market_id": market.market_id,
+                        "strategy_name": signal.strategy_name,
+                        "error": str(exc),
+                    })
+                break
+
+        # Handle FOK no-fill retry or final failure
+        if fok_no_fill:
+            if attempt < len(fok_retry_delays):
+                delay = fok_retry_delays[attempt]
+                log.info("FOK no fill (attempt %d/%d) — %s %s on %s at %.2f — retrying in %ds",
+                         attempt + 1, max_attempts,
+                         signal.strategy_name, signal.direction, market_label, rounded_price, delay)
+                await asyncio.sleep(delay)
+                continue
+            # All attempts exhausted
             status = "fok_no_fill"
-            log.info("FOK no fill — %s %s on %s at %.2f", signal.strategy_name, signal.direction, market_label, rounded_price)
+            log.info("FOK no fill — %s %s on %s at %.2f (exhausted %d attempts)",
+                     signal.strategy_name, signal.direction, market_label, rounded_price, max_attempts)
             await db.log_event("trade_fok_no_fill",
                 f"FOK no fill — {signal.strategy_name} {signal.direction} on {market.market_type} at {rounded_price:.2f}", {
                     "market_id": market.market_id,
@@ -422,89 +527,6 @@ async def execute_trade(
                     "direction": signal.direction,
                     "entry_price": rounded_price,
                     "signal_data": signal.signal_data,
-                })
-        else:
-            status = "filled"
-
-            # Extract actual filled values from order response
-            signal_shares = my_shares
-            signal_price = rounded_price
-            signal_cost = signal_shares * signal_price
-
-            actual_shares_raw = resp.get("size_matched") or resp.get("matched_size") or resp.get("filled") if isinstance(resp, dict) else None
-            actual_price_raw = resp.get("average_price") or resp.get("price") if isinstance(resp, dict) else None
-            actual_shares = int(float(actual_shares_raw)) if actual_shares_raw is not None else signal_shares
-            actual_price = float(actual_price_raw) if actual_price_raw is not None else signal_price
-            actual_cost = actual_shares * actual_price
-
-            # Overwrite for DB insert below
-            my_shares = actual_shares
-            bet_size = round(actual_cost, 2)
-
-            log.info(
-                "TRADE FILLED — %s %s on %s | signal: %d shares @ %.4f ($%.2f) | actual: %d shares @ %.4f ($%.2f) | order=%s",
-                signal.strategy_name, signal.direction, market_label,
-                signal_shares, signal_price, signal_cost,
-                actual_shares, actual_price, actual_cost,
-                order_id,
-            )
-            print(
-                f"{Fore.GREEN}*** TRADE: {signal.strategy_name} {signal.direction} on {market_label}"
-                f" — actual {actual_shares} shares @ {actual_price:.4f} = ${actual_cost:.2f}"
-                f" (signal was {signal_shares} shares @ {signal_price:.4f}) ***{Style.RESET_ALL}"
-            )
-
-            new_balance = await get_usdc_balance()
-
-            await db.log_event("trade_placed",
-                f"Placed {signal.direction} on {market.market_type} — strategy: {signal.strategy_name}", {
-                    "market_id": market.market_id,
-                    "market_type": market.market_type,
-                    "strategy_name": signal.strategy_name,
-                    "direction": signal.direction,
-                    "entry_price": actual_price,
-                    "bet_size_usd": actual_cost,
-                    "shares": actual_shares,
-                    "signal_entry_price": signal_price,
-                    "signal_shares": signal_shares,
-                    "signal_cost": signal_cost,
-                    "token_id": token_id,
-                    "order_id": order_id,
-                    "balance_after": new_balance if new_balance >= 0 else None,
-                    "signal_data": signal.signal_data,
-                })
-
-    except Exception as exc:
-        exc_msg = str(exc).lower()
-        error_notes = str(exc)[:500]  # capture for DB notes field
-        if "couldn't be fully filled" in exc_msg or "fully filled or killed" in exc_msg:
-            status = "fok_no_fill"
-            error_notes = None
-            log.info("FOK no fill — %s %s — not enough liquidity", signal.strategy_name, market_label)
-            await db.log_event("trade_fok_no_fill",
-                f"FOK no fill — {signal.strategy_name} {signal.direction} on {market.market_type}", {
-                    "market_id": market.market_id,
-                    "strategy_name": signal.strategy_name,
-                    "direction": signal.direction,
-                    "reason": "not_enough_liquidity",
-                })
-        elif "min size" in exc_msg or "invalid amount" in exc_msg:
-            status = "error"
-            log.warning("Order too small for %s — %s", market_label, exc)
-        elif "insufficient" in exc_msg or "balance" in exc_msg:
-            status = "error"
-            log.error("Insufficient funds for %s — %s", market_label, exc)
-        elif "closed" in exc_msg or "resolved" in exc_msg:
-            status = "error"
-            log.warning("Market closed/resolved for %s — skipping", market_label)
-        else:
-            status = "error"
-            log.exception("Order failed — %s", exc)
-            await db.log_event("bot_error",
-                f"Order failed for {market_label} — {exc}", {
-                    "market_id": market.market_id,
-                    "strategy_name": signal.strategy_name,
-                    "error": str(exc),
                 })
 
     # For filled trades, my_shares/bet_size were overwritten with actual fill values above
@@ -521,6 +543,7 @@ async def execute_trade(
         status=status,
         order_id=order_id,
         notes=error_notes if status == "error" else None,
+        signal_data=signal.signal_data,
     )
 
     # Place stop-loss GTC order after confirmed fill

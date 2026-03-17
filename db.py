@@ -116,6 +116,23 @@ async def _create_tables() -> None:
         await conn.execute("""
             ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS stop_loss_triggered BOOLEAN DEFAULT FALSE
         """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS signal_data JSONB
+        """)
+        # One-time fix: recalculate PnL for all resolved trades using correct formulas
+        await conn.execute("""
+            UPDATE bot_trades
+            SET pnl = CASE
+                WHEN final_outcome = 'win' THEN
+                    COALESCE(shares, bet_size_usd / NULLIF(entry_price, 0)) * (1.0 - entry_price)
+                WHEN final_outcome = 'loss' THEN
+                    -bet_size_usd
+                WHEN final_outcome = 'stop_loss' THEN
+                    (COALESCE(stop_loss_price, 0) - entry_price)
+                    * COALESCE(shares, bet_size_usd / NULLIF(entry_price, 0))
+            END
+            WHERE final_outcome IN ('win', 'loss', 'stop_loss')
+        """)
 
 
 # ── Live config ────────────────────────────────────────────────────────
@@ -261,6 +278,7 @@ async def insert_bot_trade(
     status: str,
     order_id: str | None = None,
     notes: str | None = None,
+    signal_data: dict | None = None,
 ) -> int:
     """Insert a trade record and return its id."""
     async with pool().acquire() as conn:
@@ -268,14 +286,15 @@ async def insert_bot_trade(
             INSERT INTO bot_trades
                 (market_id, market_type, strategy_name, direction,
                  entry_price, bet_size_usd, shares, token_id,
-                 condition_id, status, order_id, notes)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                 condition_id, status, order_id, notes, signal_data)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             RETURNING id
         """,
             market_id, market_type, strategy_name, direction,
             Decimal(str(entry_price)), Decimal(str(bet_size_usd)),
             Decimal(str(shares)) if shares is not None else None,
             token_id, condition_id, status, order_id, notes,
+            json.dumps(signal_data) if signal_data else None,
         )
     return row["id"]
 
@@ -331,9 +350,9 @@ async def update_pending_outcomes(clob=None) -> None:
                 resolved_at = NOW(),
                 pnl = CASE
                     WHEN mo.final_outcome = bt.direction
-                        THEN (1.0 - bt.entry_price) * bt.bet_size_usd - (0.02 * bt.bet_size_usd)
+                        THEN COALESCE(bt.shares, bt.bet_size_usd / NULLIF(bt.entry_price, 0)) * (1.0 - bt.entry_price)
                     WHEN mo.final_outcome IS NOT NULL AND mo.final_outcome != bt.direction
-                        THEN -bt.entry_price * bt.bet_size_usd - (0.02 * bt.bet_size_usd)
+                        THEN -bt.bet_size_usd
                     ELSE NULL
                 END
             FROM market_outcomes mo
@@ -375,7 +394,11 @@ async def mark_stop_loss_triggered(p, trade_id: int) -> None:
     async with p.acquire() as conn:
         await conn.execute("""
             UPDATE bot_trades
-            SET stop_loss_triggered = TRUE, final_outcome = 'stop_loss'
+            SET stop_loss_triggered = TRUE,
+                final_outcome = 'stop_loss',
+                resolved_at = NOW(),
+                pnl = (COALESCE(stop_loss_price, 0) - entry_price)
+                      * COALESCE(shares, bet_size_usd / NULLIF(entry_price, 0))
             WHERE id = $1
         """, trade_id)
 
