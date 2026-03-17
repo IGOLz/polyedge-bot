@@ -362,6 +362,7 @@ async def execute_trade(
     order_id = None
     my_shares: float | None = None
     actual_price: float | None = None
+    error_notes: str | None = None
 
     try:
         rounded_price = round(best_price, 2)
@@ -475,8 +476,10 @@ async def execute_trade(
 
     except Exception as exc:
         exc_msg = str(exc).lower()
+        error_notes = str(exc)[:500]  # capture for DB notes field
         if "couldn't be fully filled" in exc_msg or "fully filled or killed" in exc_msg:
             status = "fok_no_fill"
+            error_notes = None
             log.info("FOK no fill — %s %s — not enough liquidity", signal.strategy_name, market_label)
             await db.log_event("trade_fok_no_fill",
                 f"FOK no fill — {signal.strategy_name} {signal.direction} on {market.market_type}", {
@@ -490,7 +493,7 @@ async def execute_trade(
             log.warning("Order too small for %s — %s", market_label, exc)
         elif "insufficient" in exc_msg or "balance" in exc_msg:
             status = "error"
-            log.error("Insufficient funds for %s — skipping", market_label)
+            log.error("Insufficient funds for %s — %s", market_label, exc)
         elif "closed" in exc_msg or "resolved" in exc_msg:
             status = "error"
             log.warning("Market closed/resolved for %s — skipping", market_label)
@@ -517,6 +520,7 @@ async def execute_trade(
         condition_id=market.market_id,
         status=status,
         order_id=order_id,
+        notes=error_notes if status == "error" else None,
     )
 
     # Place stop-loss GTC order after confirmed fill
