@@ -119,6 +119,37 @@ async def _create_tables() -> None:
         await conn.execute("""
             ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS signal_data JSONB
         """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS execution_stage TEXT
+        """)
+        # Locked signal parameters + variance tracking columns
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS locked_entry_price NUMERIC(10,6)
+        """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS locked_shares NUMERIC(10,4)
+        """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS locked_cost NUMERIC(10,4)
+        """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS locked_balance NUMERIC(10,2)
+        """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS price_variance NUMERIC(10,6)
+        """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS price_variance_pct NUMERIC(10,4)
+        """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS shares_variance INTEGER
+        """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS signal_generated_at TIMESTAMPTZ
+        """)
+        await conn.execute("""
+            ALTER TABLE bot_trades ADD COLUMN IF NOT EXISTS signal_age_seconds NUMERIC(10,4)
+        """)
         # One-time fix: recalculate PnL for all resolved trades using correct formulas
         await conn.execute("""
             UPDATE bot_trades
@@ -172,6 +203,14 @@ class MarketInfo:
     # Token IDs are fetched lazily via CLOB API — cached in memory
     up_token_id: str | None = None
     down_token_id: str | None = None
+
+
+@dataclass
+class Tick:
+    market_id: str
+    time: datetime
+    up_price: float
+    down_price: float  # derived as 1 - up_price (market_ticks only stores up_price)
 
 
 @dataclass
@@ -246,6 +285,28 @@ async def get_price_at_second(market_id: str, started_at: datetime, seconds: int
 
 
 
+async def get_market_ticks(market_id: str, started_at: datetime, limit: int = 300) -> list[Tick]:
+    """Get all ticks for a market since its start time, ordered chronologically."""
+    async with pool().acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT market_id, time, up_price
+            FROM market_ticks
+            WHERE market_id = $1
+              AND time >= $2
+            ORDER BY time ASC
+            LIMIT $3
+        """, market_id, started_at, limit)
+    return [
+        Tick(
+            market_id=r["market_id"],
+            time=r["time"],
+            up_price=float(r["up_price"]),
+            down_price=round(1.0 - float(r["up_price"]), 6),
+        )
+        for r in rows
+    ]
+
+
 async def already_traded_this_market(market_id: str, strategy_name: str | None = None) -> bool:
     """Check if we already placed a trade on this market (optionally per-strategy)."""
     async with pool().acquire() as conn:
@@ -279,6 +340,17 @@ async def insert_bot_trade(
     order_id: str | None = None,
     notes: str | None = None,
     signal_data: dict | None = None,
+    execution_stage: str | None = None,
+    # Locked signal parameters + variance tracking
+    locked_entry_price: float | None = None,
+    locked_shares_count: int | None = None,
+    locked_cost: float | None = None,
+    locked_balance: float | None = None,
+    price_variance_val: float | None = None,
+    price_variance_pct_val: float | None = None,
+    shares_variance_count: int | None = None,
+    signal_generated_at: datetime | None = None,
+    signal_age_seconds: float | None = None,
 ) -> int:
     """Insert a trade record and return its id."""
     async with pool().acquire() as conn:
@@ -286,8 +358,13 @@ async def insert_bot_trade(
             INSERT INTO bot_trades
                 (market_id, market_type, strategy_name, direction,
                  entry_price, bet_size_usd, shares, token_id,
-                 condition_id, status, order_id, notes, signal_data)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                 condition_id, status, order_id, notes, signal_data,
+                 execution_stage,
+                 locked_entry_price, locked_shares, locked_cost, locked_balance,
+                 price_variance, price_variance_pct, shares_variance,
+                 signal_generated_at, signal_age_seconds)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+                    $15,$16,$17,$18,$19,$20,$21,$22,$23)
             RETURNING id
         """,
             market_id, market_type, strategy_name, direction,
@@ -295,6 +372,16 @@ async def insert_bot_trade(
             Decimal(str(shares)) if shares is not None else None,
             token_id, condition_id, status, order_id, notes,
             json.dumps(signal_data) if signal_data else None,
+            execution_stage,
+            Decimal(str(locked_entry_price)) if locked_entry_price is not None else None,
+            Decimal(str(locked_shares_count)) if locked_shares_count is not None else None,
+            Decimal(str(locked_cost)) if locked_cost is not None else None,
+            Decimal(str(locked_balance)) if locked_balance is not None else None,
+            Decimal(str(round(price_variance_val, 6))) if price_variance_val is not None else None,
+            Decimal(str(round(price_variance_pct_val, 4))) if price_variance_pct_val is not None else None,
+            shares_variance_count,
+            signal_generated_at,
+            Decimal(str(signal_age_seconds)) if signal_age_seconds is not None else None,
         )
     return row["id"]
 
@@ -336,8 +423,26 @@ async def update_bot_trade_outcome(trade_id: int, outcome: str, pnl: float) -> N
         """, outcome, Decimal(str(round(pnl, 2))), trade_id)
 
 
-async def update_pending_outcomes(clob=None) -> None:
-    """Bulk-resolve filled bot_trades by joining against market_outcomes."""
+async def update_pending_outcomes(clob=None) -> list[dict]:
+    """Bulk-resolve filled bot_trades by joining against market_outcomes.
+
+    Returns list of dicts for each newly resolved trade (for logging).
+    """
+    # 1. Identify trades that are about to resolve
+    async with pool().acquire() as conn:
+        pending = await conn.fetch("""
+            SELECT bt.id, bt.market_id, bt.market_type, bt.strategy_name,
+                   bt.direction, bt.entry_price, bt.bet_size_usd, bt.shares,
+                   mo.final_outcome AS market_outcome
+            FROM bot_trades bt
+            JOIN market_outcomes mo ON bt.market_id = mo.market_id
+            WHERE bt.status = 'filled'
+              AND bt.final_outcome IS NULL
+              AND mo.resolved = TRUE
+              AND mo.final_outcome IS NOT NULL
+        """)
+
+    # 2. Bulk resolve
     async with pool().acquire() as conn:
         await conn.execute("""
             UPDATE bot_trades bt
@@ -363,6 +468,29 @@ async def update_pending_outcomes(clob=None) -> None:
             AND mo.final_outcome IS NOT NULL
         """)
 
+    # 3. Build resolved trade summaries for logging
+    resolved: list[dict] = []
+    for r in pending:
+        entry = float(r["entry_price"])
+        bet_size = float(r["bet_size_usd"])
+        shares = float(r["shares"]) if r["shares"] is not None else (bet_size / entry if entry else 0)
+        market_outcome = r["market_outcome"]
+        won = market_outcome == r["direction"]
+        pnl = shares * (1.0 - entry) if won else -bet_size
+        resolved.append({
+            "trade_id": r["id"],
+            "market_id": r["market_id"],
+            "market_type": r["market_type"],
+            "strategy_name": r["strategy_name"],
+            "direction": r["direction"],
+            "entry_price": entry,
+            "bet_size_usd": bet_size,
+            "shares": shares,
+            "market_outcome": market_outcome,
+            "result": "win" if won else "loss",
+            "pnl": round(pnl, 2),
+        })
+
     # Cancel stop-loss orders for just-resolved trades
     if clob:
         from executor import cancel_stop_loss_order
@@ -377,6 +505,8 @@ async def update_pending_outcomes(clob=None) -> None:
             """)
         for trade in resolved_with_sl:
             await cancel_stop_loss_order(clob, pool(), trade['id'], trade['stop_loss_order_id'])
+
+    return resolved
 
 
 # ── Stop-loss helpers ──────────────────────────────────────────────────

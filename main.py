@@ -7,14 +7,13 @@ import asyncio
 import sys
 from datetime import datetime, timezone
 
-from colorama import Fore, Style, init as colorama_init
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
 
 import config
 import db
 from balance import get_usdc_balance
-from executor import execute_trade
+from executor import execute_trade, get_execution_metrics, get_variance_metrics
 from redeemer import redemption_loop
 from strategies import evaluate_strategies
 from utils import log
@@ -59,13 +58,71 @@ async def heartbeat_loop() -> None:
         await asyncio.sleep(10)
 
 
+def _fmt_market(mt: str) -> str:
+    parts = mt.split("_")
+    if len(parts) == 2:
+        return f"{parts[0].upper()} {parts[1]}"
+    return mt
+
+
 async def outcome_tracker_loop(clob) -> None:
     """Background loop: bulk-resolve filled trades via market_outcomes join."""
     log.info("Outcome tracker started (every 5 min)")
     while True:
 
         try:
-            await db.update_pending_outcomes(clob)
+            resolved = await db.update_pending_outcomes(clob)
+            for t in resolved:
+                tag = "M3" if "M3" in t["strategy_name"] else "M4" if "M4" in t["strategy_name"] else t["strategy_name"]
+                market_label = _fmt_market(t["market_type"])
+                pnl = t["pnl"]
+                result = t["result"].upper()
+
+                if t["result"] == "win":
+                    log.info(
+                        "[%s] %s | %s bet %s @%.4f (%d sh, $%.2f) → ✅ WIN | PnL: +$%.2f",
+                        tag, market_label, t["market_id"][:12],
+                        t["direction"], t["entry_price"],
+                        int(t["shares"]), t["bet_size_usd"],
+                        abs(pnl),
+                    )
+                else:
+                    log.warning(
+                        "[%s] %s | %s bet %s @%.4f (%d sh, $%.2f) → ❌ LOSS | PnL: -$%.2f",
+                        tag, market_label, t["market_id"][:12],
+                        t["direction"], t["entry_price"],
+                        int(t["shares"]), t["bet_size_usd"],
+                        abs(pnl),
+                    )
+
+                await db.log_event(
+                    f"trade_{t['result']}",
+                    f"[{tag}] {market_label} {t['direction']} → {result} | PnL: {pnl:+.2f}",
+                    {
+                        "trade_id": t["trade_id"],
+                        "market_id": t["market_id"],
+                        "market_type": t["market_type"],
+                        "strategy_name": t["strategy_name"],
+                        "direction": t["direction"],
+                        "entry_price": t["entry_price"],
+                        "shares": int(t["shares"]),
+                        "bet_size_usd": t["bet_size_usd"],
+                        "market_outcome": t["market_outcome"],
+                        "pnl": pnl,
+                    },
+                )
+
+            if resolved:
+                wins = sum(1 for t in resolved if t["result"] == "win")
+                losses = len(resolved) - wins
+                total_pnl = sum(t["pnl"] for t in resolved)
+                balance = await get_usdc_balance()
+                log.info(
+                    "Outcome batch: %d resolved (%d WIN, %d LOSS) | Batch PnL: %+.2f | Balance: $%.2f",
+                    len(resolved), wins, losses, total_pnl,
+                    balance if balance >= 0 else 0,
+                )
+
         except Exception:
             log.exception("Error in outcome tracker")
 
@@ -117,6 +174,16 @@ async def hourly_summary_loop() -> None:
             stats = await db.get_bot_stats()
             balance = await get_usdc_balance()
 
+            # Log execution metrics
+            metrics = get_execution_metrics()
+            if metrics.total > 0:
+                log.info("[EXEC METRICS] %s", metrics.summary())
+
+            # Log variance metrics (locked vs actual)
+            variance = get_variance_metrics()
+            if variance.total_trades > 0:
+                log.info("[VARIANCE METRICS] %s", variance.summary())
+
             await db.log_event("hourly_summary",
                 f"Hourly summary — ROI: {stats.roi:.1f}% | Balance: ${balance:.2f}", {
                     "period": "last_24h",
@@ -131,13 +198,20 @@ async def hourly_summary_loop() -> None:
                     "daily_loss_limit": config.DAILY_LOSS_LIMIT,
                     "pending_redemption": round(stats.pending_redemption, 2),
                     "strategies_active": stats.strategies_active,
+                    "exec_metrics": {
+                        "total": metrics.total,
+                        "filled": metrics.filled,
+                        "stage_1": metrics.stage_1_fills,
+                        "stage_2": metrics.stage_2_fills,
+                        "stage_3": metrics.stage_3_fills,
+                        "failed": metrics.failed,
+                    } if metrics.total > 0 else None,
                 })
         except Exception:
             log.exception("Error in hourly summary")
 
 
 async def run() -> None:
-    colorama_init()
     asyncio.create_task(heartbeat_loop())
 
     await verify_proxy()
@@ -207,22 +281,24 @@ async def run() -> None:
         try:
             live_config = await db.get_live_config()
 
-            # Log active strategies on first iteration (from database, not .env)
+            # Log active strategies on first iteration
             if first_iteration:
-                momentum_on = live_config.get('strategy_momentum_enabled') == 'true'
-                log.info("[CONFIG] Active strategies: %s", 'momentum' if momentum_on else 'none')
-                log.info("[CONFIG] Bet size: $%s | Daily loss limit: $%s",
-                         live_config.get('bet_size_usd', '?'), live_config.get('daily_loss_limit', '?'))
-
-                if live_config.get('strategy_momentum_enabled') == 'true':
-                    log.info("[CONFIG] Momentum enabled — bet_pct: %s | threshold: %s | entry: %s-%ss | price: %s-%s",
-                             live_config.get('momentum_bet_pct', '0.02'),
-                             live_config.get('momentum_threshold', '0.10'),
-                             live_config.get('momentum_entry_after_seconds', '65'),
-                             live_config.get('momentum_entry_until_seconds', '90'),
-                             live_config.get('momentum_price_min', '0.50'),
-                             live_config.get('momentum_price_max', '0.75'))
-
+                from strategies import M3_CONFIG, M4_CONFIG, BET_SIZING
+                active = []
+                if M3_CONFIG['enabled']:
+                    active.append('M3_spike_reversion')
+                if M4_CONFIG['enabled']:
+                    active.append('M4_volatility')
+                log.info("[CONFIG] Active strategies: %s", ', '.join(active) or 'none')
+                log.info("[CONFIG] M3 params — spike_threshold: %.2f | reversion: %.0f%% | window: %ds | min_reversion_ticks: %d",
+                         M3_CONFIG['spike_threshold_up'], M3_CONFIG['reversion_reversal_pct'] * 100,
+                         M3_CONFIG['spike_detection_window_seconds'], M3_CONFIG['min_reversion_ticks'])
+                log.info("[CONFIG] M4 params — eval_second: %d | vol_threshold: %.2f | spread: [%.2f, %.2f]",
+                         M4_CONFIG['eval_second'], M4_CONFIG['volatility_threshold'],
+                         M4_CONFIG['min_spread'], M4_CONFIG['max_spread'])
+                log.info("[CONFIG] Bet sizing: %.0f%% of bankroll | Daily loss limit: $%s",
+                         BET_SIZING['bet_percentage'] * 100,
+                         live_config.get('daily_loss_limit', '?'))
                 first_iteration = False
 
             # Log any config changes
@@ -238,7 +314,8 @@ async def run() -> None:
 
 
             for market in active_markets:
-                signals = await evaluate_strategies(market, live_config)
+                ticks = await db.get_market_ticks(market.market_id, market.started_at)
+                signals = await evaluate_strategies(market, ticks)
                 for signal in signals:
                     await execute_trade(clob, market, signal, live_config)
 
