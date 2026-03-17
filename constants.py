@@ -59,8 +59,8 @@ M4_CONFIG = {
     'allowed_assets': ['btc', 'eth', 'sol', 'xrp'],
     'min_seconds_remaining': 60,
 
-    # Risk Management
-    'stop_loss_enabled': True,
+    # Risk Management (stop-loss disabled — not in original backtest, was inverting exits)
+    'stop_loss_enabled': False,
     'stop_loss_price': 0.30,
 
     # Logging

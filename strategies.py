@@ -552,18 +552,18 @@ async def evaluate_m4_signal(market: db.MarketInfo, ticks: list[db.Tick]) -> Sig
             log.debug("M4: %s — low volatility (%.6f < %.2f)", market.market_id[:16], volatility, vol_threshold)
         return None
 
-    # DETERMINE: Bet direction (momentum — follow the dominant direction)
-    # If UP price > 0.50, market momentum favors UP -> bet UP
-    # If UP price < 0.50, market momentum favors DOWN -> bet DOWN
+    # DETERMINE: Bet direction (CONTRARIAN — bet against the extreme/dominant side)
+    # If UP price > 0.50, UP is extreme -> bet DOWN (buy cheap DOWN tokens)
+    # If UP price < 0.50, DOWN is extreme -> bet UP (buy cheap UP tokens)
     if up_price > 0.50:
-        direction = 'Up'
-        entry_price = up_price
-    else:
         direction = 'Down'
-        entry_price = down_price
+        entry_price = down_price  # buying the cheap contrarian side
+    else:
+        direction = 'Up'
+        entry_price = up_price   # buying the cheap contrarian side
 
-    debug_log.info(
-        "[M4-DEBUG] Direction decided: up=%.4f, down=%.4f → %s (momentum) | entry=$%.4f",
+    log.info(
+        "[M4] Direction decided: up=%.4f, down=%.4f → %s (contrarian) | entry=$%.4f",
         up_price, down_price, direction, entry_price,
     )
 
@@ -599,7 +599,7 @@ async def evaluate_m4_signal(market: db.MarketInfo, ticks: list[db.Tick]) -> Sig
     # Profitability thesis
     thesis = (
         f"Volatility spike (sigma={volatility:.4f}) at second {seconds_elapsed:.0f}. "
-        f"Betting {direction} momentum — following dominant direction "
+        f"Betting {direction} contrarian — against dominant/extreme side "
         f"(up={up_price:.4f}, down={down_price:.4f}, spread={spread:.4f})."
     )
 
