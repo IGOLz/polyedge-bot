@@ -18,6 +18,7 @@ class Signal:
     entry_price: float    # price of the token we'd buy
     signal_data: dict[str, Any] = field(default_factory=dict)
     confidence_multiplier: float = 1.0
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 def calculate_shares(balance: float, entry_price: float, live_config: dict) -> int:

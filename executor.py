@@ -408,6 +408,11 @@ async def execute_trade(
     fok_retry_delays = [1, 2, 3]  # seconds between retries
     max_attempts = 1 + len(fok_retry_delays)
 
+    # Log time elapsed since signal was generated
+    signal_age_ms = (datetime.now(timezone.utc) - signal.created_at).total_seconds() * 1000
+    log.info("[TIMING] Signal age at order submission: %.0fms — %s %s on %s",
+             signal_age_ms, signal.strategy_name, signal.direction, market_label)
+
     for attempt in range(max_attempts):
         fok_no_fill = False
         try:
@@ -438,6 +443,41 @@ async def execute_trade(
                 actual_shares = int(float(actual_shares_raw)) if actual_shares_raw is not None else signal_shares
                 actual_price = float(actual_price_raw) if actual_price_raw is not None else signal_price
                 actual_cost = actual_shares * actual_price
+
+                # Post-fill price validation against configured range
+                fill_price_min = float(live_config.get('momentum_price_min', '0.50'))
+                fill_price_max = float(live_config.get('momentum_price_max', '0.75'))
+                if actual_price < fill_price_min or actual_price > fill_price_max:
+                    status = "filled_price_rejected"
+                    my_shares = actual_shares
+                    bet_size = round(actual_cost, 2)
+                    log.warning(
+                        "FILL PRICE REJECTED — %s %s on %s | filled @ %.4f outside [%.2f, %.2f] | signal was %.4f | slippage: %.4f",
+                        signal.strategy_name, signal.direction, market_label,
+                        actual_price, fill_price_min, fill_price_max,
+                        signal_price, actual_price - signal_price,
+                    )
+                    print(
+                        f"{Fore.RED}*** FILL REJECTED: {signal.strategy_name} {signal.direction} on {market_label}"
+                        f" — filled @ {actual_price:.4f} outside [{fill_price_min:.2f}, {fill_price_max:.2f}]"
+                        f" (signal was {signal_price:.4f}, slippage {actual_price - signal_price:+.4f}) ***{Style.RESET_ALL}"
+                    )
+                    await db.log_event("trade_fill_price_rejected",
+                        f"Fill price {actual_price:.4f} outside [{fill_price_min:.2f}, {fill_price_max:.2f}] on {market.market_type}", {
+                            "market_id": market.market_id,
+                            "market_type": market.market_type,
+                            "strategy_name": signal.strategy_name,
+                            "direction": signal.direction,
+                            "actual_price": actual_price,
+                            "signal_price": signal_price,
+                            "slippage": round(actual_price - signal_price, 4),
+                            "price_min": fill_price_min,
+                            "price_max": fill_price_max,
+                            "shares": actual_shares,
+                            "order_id": order_id,
+                            "signal_data": signal.signal_data,
+                        })
+                    break
 
                 # Overwrite for DB insert below
                 my_shares = actual_shares
