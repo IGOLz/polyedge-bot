@@ -209,10 +209,8 @@ async def run() -> None:
 
             # Log active strategies on first iteration (from database, not .env)
             if first_iteration:
-                enabled = [k.replace('strategy_', '').replace('_enabled', '')
-                           for k, v in live_config.items()
-                           if k.endswith('_enabled') and v == 'true']
-                log.info("[CONFIG] Active strategies: %s", ', '.join(enabled) or 'none')
+                momentum_on = live_config.get('strategy_momentum_enabled') == 'true'
+                log.info("[CONFIG] Active strategies: %s", 'momentum' if momentum_on else 'none')
                 log.info("[CONFIG] Bet size: $%s | Daily loss limit: $%s",
                          live_config.get('bet_size_usd', '?'), live_config.get('daily_loss_limit', '?'))
 
